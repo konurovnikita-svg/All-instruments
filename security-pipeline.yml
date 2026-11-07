@@ -1,0 +1,420 @@
+# =============================================================================
+# Security Pipeline — единый конвейер проверки безопасности проекта
+#
+#   SAST:           Semgrep + CodeQL
+#   Secret scanning: Gitleaks + TruffleHog
+#   SBOM:           cdxgen + Syft (CycloneDX)
+#   SCA:            OSV-Scanner + Grype (по SBOM)
+#
+# Пайплайн сам определяет языки и структуру проекта (scripts/detect.py),
+# выбирает применимые инструменты и сводит все находки в единый отчёт
+# (scripts/normalize_report.py): report.html / report.md / findings.json.
+#
+# Запуск:
+#   * push / pull request — проверяется этот репозиторий;
+#   * workflow_dispatch — можно указать любой репозиторий (target_repository).
+# =============================================================================
+name: Security Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      target_repository:
+        description: 'Репозиторий для проверки (owner/repo). Пусто — этот репозиторий'
+        required: false
+        type: string
+        default: ''
+      target_ref:
+        description: 'Ветка, тег или SHA цели. Пусто — ветка по умолчанию'
+        required: false
+        type: string
+        default: ''
+      fail_on:
+        description: 'Quality gate: падать при находках не ниже уровня'
+        required: true
+        type: choice
+        options: [none, medium, high, critical]
+        default: high
+
+permissions:
+  contents: read
+  security-events: write   # публикация SARIF во вкладку Security
+  actions: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RESULTS_DIR: security-results
+  GATE: ${{ inputs.fail_on || 'high' }}
+
+jobs:
+  # ------------------------------------------------------------------ detect
+  detect:
+    name: 'Этап 0 · Анализ проекта и выбор инструментов'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      semgrep: ${{ steps.plan.outputs.semgrep }}
+      codeql: ${{ steps.plan.outputs.codeql }}
+      codeql_matrix: ${{ steps.plan.outputs.codeql_matrix }}
+      cdxgen: ${{ steps.plan.outputs.cdxgen }}
+      osv_scanner: ${{ steps.plan.outputs.osv_scanner }}
+    steps:
+      - name: Checkout pipeline
+        uses: actions/checkout@v4
+        with:
+          path: pipeline
+
+      - name: Checkout target project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repository || github.repository }}
+          ref: ${{ inputs.target_ref || '' }}
+          path: target
+          fetch-depth: 0          # нужна история git для secret scanning
+
+      - name: Detect languages, ecosystems and select tools
+        id: plan
+        run: |
+          mkdir -p "$RESULTS_DIR"
+          python3 pipeline/scripts/detect.py \
+            --target target \
+            --out "$RESULTS_DIR/plan.json" | tee detect.log
+          {
+            echo '## План проверки'
+            echo '```json'
+            cat "$RESULTS_DIR/plan.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload scan plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-plan
+          path: ${{ env.RESULTS_DIR }}/plan.json
+          retention-days: 14
+
+  # ----------------------------------------------------------------- secrets
+  secrets:
+    name: 'Этап 1 · Secret scanning (Gitleaks, TruffleHog)'
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout pipeline
+        uses: actions/checkout@v4
+        with:
+          path: pipeline
+
+      - name: Checkout target project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repository || github.repository }}
+          ref: ${{ inputs.target_ref || '' }}
+          path: target
+          fetch-depth: 0
+
+      - name: Install Gitleaks
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          url=$(curl -sSf -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/gitleaks/gitleaks/releases/latest \
+            | jq -r '.assets[] | select(.name | test("linux_x64\\.tar\\.gz$")) | .browser_download_url')
+          curl -sSfL "$url" | sudo tar -xz -C /usr/local/bin gitleaks
+
+      - name: Install TruffleHog
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+
+      - name: Run secret scanners
+        run: |
+          mkdir -p "$RESULTS_DIR/raw/gitleaks" "$RESULTS_DIR/raw/trufflehog"
+          # Gitleaks: история git, значения секретов скрываются (--redact)
+          gitleaks git --redact --no-banner \
+            --report-format json \
+            --report-path "$RESULTS_DIR/raw/gitleaks/results.json" target || true
+          [ -s "$RESULTS_DIR/raw/gitleaks/results.json" ] \
+            || echo '[]' > "$RESULTS_DIR/raw/gitleaks/results.json"
+          # TruffleHog: второй набор детекторов, без верификации на сервисах;
+          # сырьё остаётся в артефакте job-а, в единый отчёт значения не попадают
+          trufflehog git "file://$GITHUB_WORKSPACE/target" \
+            --json --no-update --no-verification \
+            > "$RESULTS_DIR/raw/trufflehog/raw.jsonl" || true
+          # Очистка: в отчёт и артефакты значения секретов не попадают
+          jq -R -c 'fromjson? | {DetectorName, SourceMetadata, Verified}' \
+            "$RESULTS_DIR/raw/trufflehog/raw.jsonl" \
+            > "$RESULTS_DIR/raw/trufflehog/results.json" || true
+          rm -f "$RESULTS_DIR/raw/trufflehog/raw.jsonl"
+
+      - name: Upload raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-secrets
+          path: ${{ env.RESULTS_DIR }}/raw
+          retention-days: 14
+
+  # -------------------------------------------------------------- sast-semgrep
+  sast-semgrep:
+    name: 'Этап 2 · SAST (Semgrep)'
+    needs: detect
+    if: needs.detect.outputs.semgrep == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout pipeline
+        uses: actions/checkout@v4
+        with:
+          path: pipeline
+
+      - name: Checkout target project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repository || github.repository }}
+          ref: ${{ inputs.target_ref || '' }}
+          path: target
+          fetch-depth: 1
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Download scan plan
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-plan
+          path: ${{ env.RESULTS_DIR }}
+
+      - name: Run Semgrep (rule packs from scan plan)
+        run: |
+          mkdir -p "$RESULTS_DIR/raw/semgrep"
+          CONFIGS=()
+          while IFS= read -r cfg; do CONFIGS+=(--config "$cfg"); done \
+            < <(jq -r '.tools.semgrep.configs[]' "$RESULTS_DIR/plan.json")
+          semgrep scan "${CONFIGS[@]}" \
+            --json --output "$RESULTS_DIR/raw/semgrep/semgrep.json" \
+            --exclude node_modules --exclude .git --exclude dist --exclude build \
+            target || true
+
+      - name: Upload raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-semgrep
+          path: ${{ env.RESULTS_DIR }}/raw
+          retention-days: 14
+
+  # --------------------------------------------------------------- sast-codeql
+  sast-codeql:
+    name: 'Этап 2 · SAST CodeQL (${{ matrix.language }})'
+    needs: detect
+    if: needs.detect.outputs.codeql == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.codeql_matrix) }}
+    steps:
+      - name: Checkout target project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repository || github.repository }}
+          ref: ${{ inputs.target_ref || '' }}
+          path: target
+          fetch-depth: 1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          source-root: target
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          output: ${{ env.RESULTS_DIR }}/raw/codeql
+          upload: never
+          category: codeql-${{ matrix.language }}
+
+      - name: Upload raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-codeql-${{ matrix.language }}
+          path: ${{ env.RESULTS_DIR }}/raw
+          retention-days: 14
+
+  # --------------------------------------------------------------------- sbom
+  sbom:
+    name: 'Этап 3 · SBOM (cdxgen, Syft)'
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout pipeline
+        uses: actions/checkout@v4
+        with:
+          path: pipeline
+
+      - name: Checkout target project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repository || github.repository }}
+          ref: ${{ inputs.target_ref || '' }}
+          path: target
+          fetch-depth: 1
+
+      - name: Install cdxgen and Syft
+        run: |
+          npm install -g @cyclonedx/cdxgen
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+
+      - name: Build SBOM from dependency graph (cdxgen)
+        if: needs.detect.outputs.cdxgen == 'true'
+        run: |
+          mkdir -p "$RESULTS_DIR/raw/sbom/cdxgen"
+          cdxgen --recurse \
+            --output "$RESULTS_DIR/raw/sbom/cdxgen/sbom.cdx.json" target || true
+
+      - name: Build SBOM from filesystem (Syft)
+        run: |
+          mkdir -p "$RESULTS_DIR/raw/sbom/syft"
+          syft packages dir:target \
+            -o "cyclonedx-json=$RESULTS_DIR/raw/sbom/syft/sbom.cdx.json" || true
+
+      - name: Upload SBOM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-sbom
+          path: ${{ env.RESULTS_DIR }}/raw
+          retention-days: 30
+
+  # ---------------------------------------------------------------------- sca
+  sca:
+    name: 'Этап 4 · SCA (OSV-Scanner, Grype)'
+    needs: [detect, sbom]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout target project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repository || github.repository }}
+          ref: ${{ inputs.target_ref || '' }}
+          path: target
+          fetch-depth: 1
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-sbom
+          path: ${{ env.RESULTS_DIR }}/raw
+
+      - name: Install OSV-Scanner and Grype
+        run: |
+          curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 \
+            -o /tmp/osv-scanner
+          sudo install -m 0755 /tmp/osv-scanner /usr/local/bin/osv-scanner
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+
+      - name: Run OSV-Scanner (lockfiles and manifests)
+        if: needs.detect.outputs.osv_scanner == 'true'
+        run: |
+          mkdir -p "$RESULTS_DIR/raw/osv"
+          (cd target && osv-scanner scan source -r . --no-ignore \
+             --format json --output-file "$GITHUB_WORKSPACE/$RESULTS_DIR/raw/osv/osv.json") || true
+
+      - name: Run Grype (by SBOM)
+        run: |
+          mkdir -p "$RESULTS_DIR/raw/grype"
+          if [ -s "$RESULTS_DIR/raw/sbom/syft/sbom.cdx.json" ]; then
+            grype "sbom:$RESULTS_DIR/raw/sbom/syft/sbom.cdx.json" \
+              -o json --file "$RESULTS_DIR/raw/grype/grype.json" || true
+          else
+            grype dir:target -o json --file "$RESULTS_DIR/raw/grype/grype.json" || true
+          fi
+
+      - name: Upload raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-sca
+          path: ${{ env.RESULTS_DIR }}/raw
+          retention-days: 14
+
+  # ------------------------------------------------------------------- report
+  report:
+    name: 'Этап 5 · Единый отчёт и quality gate'
+    needs: [detect, secrets, sast-semgrep, sast-codeql, sbom, sca]
+    if: always() && needs.detect.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout pipeline
+        uses: actions/checkout@v4
+        with:
+          path: pipeline
+
+      - name: Download all raw results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: raw-*
+          path: ${{ env.RESULTS_DIR }}/raw
+          merge-multiple: true
+
+      - name: Download scan plan
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-plan
+          path: ${{ env.RESULTS_DIR }}
+
+      - name: Build unified report
+        id: report
+        run: |
+          PROJECT="${{ inputs.target_repository || github.repository }}"
+          python3 pipeline/scripts/normalize_report.py \
+            --raw "$RESULTS_DIR/raw" \
+            --plan "$RESULTS_DIR/plan.json" \
+            --out "$RESULTS_DIR" \
+            --project "${PROJECT##*/}" \
+            --ref "${{ github.sha }}" \
+            --target "$GITHUB_WORKSPACE/target"
+          cat "$RESULTS_DIR/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unified report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: |
+            ${{ env.RESULTS_DIR }}/report.html
+            ${{ env.RESULTS_DIR }}/report.md
+            ${{ env.RESULTS_DIR }}/findings.json
+            ${{ env.RESULTS_DIR }}/plan.json
+          retention-days: 30
+
+      - name: Quality gate
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          order = {'info': 0, 'low': 1, 'medium': 2, 'high': 3, 'critical': 4}
+          gate = os.environ['GATE']
+          if gate == 'none':
+              print('Quality gate отключён (fail_on=none)')
+              sys.exit(0)
+          findings = json.load(open(os.path.join(os.environ['RESULTS_DIR'], 'findings.json'), encoding='utf-8'))['findings']
+          bad = [f for f in findings if order[f['severity']] >= order[gate]]
+          print(f'Quality gate {gate}: находок не ниже порога — {len(bad)}')
+          sys.exit(1 if bad else 0)
+          PY

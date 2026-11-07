@@ -1,0 +1,15 @@
+# Конфигурация Gitleaks пайплайна: правила по умолчанию + allowlist служебных путей.
+title = "security-pipeline"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Служебные каталоги и отчёты самого пайплайна"
+paths = [
+  '''security-results/''',
+  '''examples/''',
+  '''node_modules/''',
+  '''.*\.sarif''',
+  '''findings\.json''',
+]

@@ -1,0 +1,1037 @@
+{
+  "meta": {
+    "project": "vampi",
+    "ref": "f16052d",
+    "generated_at": "2026-11-07 18:05 UTC",
+    "languages": [
+      "Python"
+    ]
+  },
+  "plan": {
+    "target": "/tmp/vampi",
+    "facts": {
+      "files_total": 22,
+      "languages": [
+        {
+          "key": "python",
+          "name": "Python",
+          "files": 11,
+          "codeql": "python"
+        }
+      ],
+      "codeql_languages": [
+        "python"
+      ],
+      "manifests": [
+        "requirements.txt"
+      ],
+      "lockfiles": [],
+      "ecosystems": [
+        "PyPI"
+      ],
+      "has_dockerfile": true,
+      "has_compose": true,
+      "git": {
+        "present": true,
+        "commits": 68
+      }
+    },
+    "tools": {
+      "semgrep": {
+        "run": true,
+        "category": "SAST",
+        "reason": "Обнаружен исходный код (Python); наборы правил: p/security-audit, p/secrets, p/owasp-top-ten, p/python, p/docker",
+        "configs": [
+          "p/security-audit",
+          "p/secrets",
+          "p/owasp-top-ten",
+          "p/python",
+          "p/docker"
+        ]
+      },
+      "codeql": {
+        "run": true,
+        "category": "SAST",
+        "reason": "Языки с поддержкой анализа потока данных CodeQL: python",
+        "languages": [
+          "python"
+        ]
+      },
+      "gitleaks": {
+        "run": true,
+        "category": "Secrets",
+        "mode": "git",
+        "reason": "Сканирование истории git (68 коммитов); детекторы по известным шаблонам ключей и generic-правилам"
+      },
+      "trufflehog": {
+        "run": true,
+        "category": "Secrets",
+        "mode": "git",
+        "reason": "Второй, независимый набор детекторов сервисов (верификация отключена: найденные значения не проверяются на стороне сервисов и не попадают в отчёт)"
+      },
+      "cdxgen": {
+        "run": true,
+        "category": "SBOM",
+        "reason": "Манифесты зависимостей: requirements.txt — SBOM строится из графа зависимостей исходного кода"
+      },
+      "syft": {
+        "run": true,
+        "category": "SBOM",
+        "reason": "Инвентаризация файловой системы проекта целиком, включая Docker-образ из Dockerfile — покрывает пакеты ОС, бинарные артефакты и зависимости вне манифестов"
+      },
+      "osv-scanner": {
+        "run": true,
+        "category": "SCA",
+        "reason": "Экосистемы зависимостей: PyPI; сверка lock-файлов и манифестов с базой OSV"
+      },
+      "grype": {
+        "run": true,
+        "category": "SCA",
+        "reason": "Анализ SBOM (Syft, при наличии — также cdxgen): уязвимости пакетов ОС и зависимостей, не попавших в lock-файлы"
+      }
+    }
+  },
+  "tool_runs": [
+    {
+      "tool": "Semgrep",
+      "category": "SAST",
+      "status": "Выполнен",
+      "raw_findings": 7
+    },
+    {
+      "tool": "CodeQL",
+      "category": "SAST",
+      "status": "Выполнен",
+      "raw_findings": 3
+    },
+    {
+      "tool": "Gitleaks",
+      "category": "Secrets",
+      "status": "Выполнен",
+      "raw_findings": 1
+    },
+    {
+      "tool": "TruffleHog",
+      "category": "Secrets",
+      "status": "Выполнен",
+      "raw_findings": 0
+    },
+    {
+      "tool": "OSV-Scanner",
+      "category": "SCA",
+      "status": "Выполнен",
+      "raw_findings": 82
+    },
+    {
+      "tool": "Grype",
+      "category": "SCA",
+      "status": "Выполнен",
+      "raw_findings": 15
+    }
+  ],
+  "sbom": [
+    {
+      "tool": "cdxgen",
+      "sbom": {
+        "stats": {
+          "components": 30,
+          "ecosystems": {
+            "pypi": 26,
+            "github": 4
+          }
+        },
+        "sample": [
+          "PyJWT@2.6.0",
+          "Werkzeug@2.2.3",
+          "attrs@26.1.0",
+          "build-push-action@v3",
+          "certifi@2026.10.23",
+          "charset-normalizer@3.5.2",
+          "click@8.5.1",
+          "clickclick@20.10.2",
+          "connexion@2.14.2",
+          "flask-sqlalchemy@3.0.3",
+          "flask@2.2.2",
+          "greenlet@3.5.6",
+          "idna@3.20",
+          "inflection@0.5.1",
+          "itsdangerous@2.2.0"
+        ]
+      }
+    },
+    {
+      "tool": "syft",
+      "sbom": {
+        "stats": {
+          "components": 13,
+          "ecosystems": {
+            "pypi": 7,
+            "github": 4,
+            "file": 2
+          }
+        },
+        "sample": [
+          "/.github/workflows/docker-image.yml@",
+          "/requirements.txt@",
+          "connexion@2.14.2",
+          "docker/build-push-action@v3",
+          "docker/login-action@v2",
+          "docker/setup-buildx-action@v2",
+          "docker/setup-qemu-action@v2",
+          "flask-sqlalchemy@3.0.3",
+          "flask@2.2.2",
+          "jsonschema@4.17.3",
+          "markupsafe@2.1.2",
+          "pyjwt@2.6.0",
+          "sqlalchemy@2.0.2"
+        ]
+      }
+    }
+  ],
+  "findings": [
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-102268",
+      "title": "PyJWT: Asymmetric-PEM detection bypass: whitespace/line-ending-mutated public keys skip the HS/asymmetric confusion guard",
+      "severity": "critical",
+      "cwe": "",
+      "package": "pyjwt",
+      "version": "2.6.0",
+      "ecosystem": "PyPI",
+      "fixed": "2.14.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "**Prerequisites** (both conditions must hold; both are deployment properties, not attacker-controlled at request time):\n\n- The `jwt.decode` allow-list mixes an HMAC algorithm with an asymmetric one, e.g. `algorithms=[\"ES256\", \"HS256\"]` (the RFC 8725 footgun the guard exists to backstop).\n- The verif",
+      "aliases": [
+        "CVE-2026-102268",
+        "GHSA-ffc3-869f-jxw9"
+      ],
+      "sources": [
+        "OSV-Scanner",
+        "Grype"
+      ],
+      "id": "F-0001"
+    },
+    {
+      "category": "SAST",
+      "source": "Semgrep",
+      "rule": "github-actions-mutable-action-tag",
+      "title": "GitHub Actions step uses a mutable tag or branch reference. Tags and branch names can be silently repointed by the action owner, enabling supply-chain attacks — as seen in the trivy-action and kics-gi",
+      "severity": "high",
+      "cwe": "CWE-1357",
+      "file": ".github/workflows/docker-image.yml",
+      "line": 16,
+      "description": "GitHub Actions step uses a mutable tag or branch reference. Tags and branch names can be silently repointed by the action owner, enabling supply-chain attacks — as seen in the trivy-action and kics-github-action compromises. Pin the reference to a full 40-character commit SHA instead, e.g. `uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608`.",
+      "sources": [
+        "Semgrep"
+      ],
+      "id": "F-0002"
+    },
+    {
+      "category": "SAST",
+      "source": "Semgrep",
+      "rule": "github-actions-mutable-action-tag",
+      "title": "GitHub Actions step uses a mutable tag or branch reference. Tags and branch names can be silently repointed by the action owner, enabling supply-chain attacks — as seen in the trivy-action and kics-gi",
+      "severity": "high",
+      "cwe": "CWE-1357",
+      "file": ".github/workflows/docker-image.yml",
+      "line": 19,
+      "description": "GitHub Actions step uses a mutable tag or branch reference. Tags and branch names can be silently repointed by the action owner, enabling supply-chain attacks — as seen in the trivy-action and kics-github-action compromises. Pin the reference to a full 40-character commit SHA instead, e.g. `uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608`.",
+      "sources": [
+        "Semgrep"
+      ],
+      "id": "F-0003"
+    },
+    {
+      "category": "SAST",
+      "source": "Semgrep",
+      "rule": "github-actions-mutable-action-tag",
+      "title": "GitHub Actions step uses a mutable tag or branch reference. Tags and branch names can be silently repointed by the action owner, enabling supply-chain attacks — as seen in the trivy-action and kics-gi",
+      "severity": "high",
+      "cwe": "CWE-1357",
+      "file": ".github/workflows/docker-image.yml",
+      "line": 22,
+      "description": "GitHub Actions step uses a mutable tag or branch reference. Tags and branch names can be silently repointed by the action owner, enabling supply-chain attacks — as seen in the trivy-action and kics-github-action compromises. Pin the reference to a full 40-character commit SHA instead, e.g. `uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608`.",
+      "sources": [
+        "Semgrep"
+      ],
+      "id": "F-0004"
+    },
+    {
+      "category": "SAST",
+      "source": "Semgrep",
+      "rule": "github-actions-mutable-action-tag",
+      "title": "GitHub Actions step uses a mutable tag or branch reference. Tags and branch names can be silently repointed by the action owner, enabling supply-chain attacks — as seen in the trivy-action and kics-gi",
+      "severity": "high",
+      "cwe": "CWE-1357",
+      "file": ".github/workflows/docker-image.yml",
+      "line": 28,
+      "description": "GitHub Actions step uses a mutable tag or branch reference. Tags and branch names can be silently repointed by the action owner, enabling supply-chain attacks — as seen in the trivy-action and kics-github-action compromises. Pin the reference to a full 40-character commit SHA instead, e.g. `uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608`.",
+      "sources": [
+        "Semgrep"
+      ],
+      "id": "F-0005"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2025-45768",
+      "title": "PYSEC-2025-183",
+      "severity": "high",
+      "cwe": "",
+      "package": "pyjwt",
+      "version": "2.6.0",
+      "ecosystem": "PyPI",
+      "fixed": "",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "pyjwt v2.10.1 was discovered to contain weak encryption. NOTE: this is disputed by the Supplier because the key length is chosen by the application that uses the library (admittedly, library users may benefit from a minimum value and a mechanism for opting in to strict enforcement).",
+      "aliases": [
+        "CVE-2025-45768"
+      ],
+      "sources": [
+        "OSV-Scanner"
+      ],
+      "id": "F-0006"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-32597",
+      "title": "PYSEC-2026-120",
+      "severity": "high",
+      "cwe": "",
+      "package": "pyjwt",
+      "version": "2.6.0",
+      "ecosystem": "PyPI",
+      "fixed": "2.12.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "PyJWT is a JSON Web Token implementation in Python. Prior to 2.12.0, PyJWT does not validate the crit (Critical) Header Parameter defined in RFC 7515 §4.1.11. When a JWS token contains a crit array listing extensions that PyJWT does not understand, the library accepts the token instead of rejecting ",
+      "aliases": [
+        "CVE-2026-32597",
+        "GHSA-752w-5fwx-jx9f"
+      ],
+      "sources": [
+        "OSV-Scanner",
+        "Grype"
+      ],
+      "id": "F-0007"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-48526",
+      "title": "PYSEC-2026-179",
+      "severity": "high",
+      "cwe": "",
+      "package": "pyjwt",
+      "version": "2.6.0",
+      "ecosystem": "PyPI",
+      "fixed": "2.13.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "PyJWT is a JSON Web Token implementation in Python. Prior to 2.13.0, when the verifier is decoding JSON Web Tokens, while supporting both asymmetric and HMAC algorithms, the library does not validate use of JSON Web Keys in HMAC algorithm, allowing attacker to use the issuer public key as the secret",
+      "aliases": [
+        "CVE-2026-48526",
+        "GHSA-xgmm-8j9v-c9wx"
+      ],
+      "sources": [
+        "OSV-Scanner",
+        "Grype"
+      ],
+      "id": "F-0008"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-102267",
+      "title": "PyJWT: PyJWKClient follows redirects when fetching JWKS",
+      "severity": "high",
+      "cwe": "",
+      "package": "pyjwt",
+      "version": "2.6.0",
+      "ecosystem": "PyPI",
+      "fixed": "2.14.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "### Summary\n\nPyJWT 2.13.0 `PyJWKClient` followed HTTP redirects while fetching a JWKS,\nwithout validating the redirect destination. A configured trusted endpoint\ncould therefore redirect the client to a different host.\n\n### Impact\n\nWhen an application uses `PyJWKClient` with caller-supplied request ",
+      "aliases": [
+        "CVE-2026-102267",
+        "GHSA-9v7f-9g4p-ffgj"
+      ],
+      "sources": [
+        "OSV-Scanner",
+        "Grype"
+      ],
+      "id": "F-0009"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-102270",
+      "title": "PyJWT: ReDoS vulnerability when calling the `is_pem_format` function.",
+      "severity": "high",
+      "cwe": "",
+      "package": "pyjwt",
+      "version": "2.6.0",
+      "ecosystem": "PyPI",
+      "fixed": "2.14.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "### Summary\nThere is a Re-DoS vulnerability in the `is_pem_format` function which results in a intesive CPU usage if an attacker is been able to provide a custom certificate.\n\n\n### Details\nThe problem is that the lazy quantifier `.+?` will always first try to match as little as possible until it fin",
+      "aliases": [
+        "CVE-2026-102270",
+        "GHSA-jwrc-g2q2-pq5p"
+      ],
+      "sources": [
+        "OSV-Scanner",
+        "Grype"
+      ],
+      "id": "F-0010"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-102271",
+      "title": "PyJWT: Public keys in DER form are accepted as HMAC secrets, bypassing the CVE-2022-29217 guard",
+      "severity": "high",
+      "cwe": "",
+      "package": "pyjwt",
+      "version": "2.6.0",
+      "ecosystem": "PyPI",
+      "fixed": "2.14.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "### Summary\n\n`HMACAlgorithm.prepare_key` blocks asymmetric keys from being used as HMAC secrets by searching for text markers only. It looks for `-----BEGIN` and for an `ssh-` prefix. The same key in DER form is binary ASN.1 and has neither marker, so it passes the check and is used as an HMAC secre",
+      "aliases": [
+        "CVE-2026-102271",
+        "GHSA-p4g4-x82p-q773"
+      ],
+      "sources": [
+        "OSV-Scanner",
+        "Grype"
+      ],
+      "id": "F-0011"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-102275",
+      "title": "PYSEC-2026-4183",
+      "severity": "high",
+      "cwe": "",
+      "package": "pyjwt",
+      "version": "2.6.0",
+      "ecosystem": "PyPI",
+      "fixed": "2.15.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "PyJWT is a Python implementation of JSON Web Token standards. From 2.1.0 until 2.15.0, PyJWT OKPAlgorithm.from_jwk in  jwt/algorithms.py is affected because private-JWK import path does not compare the public key derived from d with x. This occurs when an OKP private JWK supplies non-corresponding x",
+      "aliases": [
+        "CVE-2026-102275",
+        "GHSA-x33g-cr3x-6449"
+      ],
+      "sources": [
+        "OSV-Scanner",
+        "Grype"
+      ],
+      "id": "F-0012"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "GHSA-pxh4-856f-4h89",
+      "title": "PyJWT: HS256/384/512 verify accepts empty HMAC key via oct JWK (PyJWK/PyJWKClient) enabling token forgery",
+      "severity": "high",
+      "cwe": "CWE-347",
+      "package": "pyjwt",
+      "version": "2.6.0",
+      "ecosystem": "PyPI",
+      "fixed": "2.14.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "### Summary\n\n`HMACAlgorithm.from_jwk` accepts a symmetric (`kty=oct`) JWK whose `k` value is\nthe empty string and returns a zero-length key without raising. When a token is\nthen verified with that key object (a `PyJWK`, or a `PyJWK` resolved by\n`PyJWKSet` / `PyJWKClient`), the HMAC verifier computes",
+      "aliases": [],
+      "sources": [
+        "OSV-Scanner",
+        "Grype"
+      ],
+      "id": "F-0013"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2023-30861",
+      "title": "PYSEC-2023-62",
+      "severity": "high",
+      "cwe": "",
+      "package": "flask",
+      "version": "2.2.2",
+      "ecosystem": "PyPI",
+      "fixed": "2.3.2",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "Flask is a lightweight WSGI web application framework. When all of the following conditions are met, a response containing data intended for one client may be cached and subsequently sent by the proxy to other clients. If the proxy also caches `Set-Cookie` headers, it may send one client's `session`",
+      "aliases": [
+        "CVE-2023-30861",
+        "GHSA-m2qf-hxjv-5gpq"
+      ],
+      "sources": [
+        "OSV-Scanner",
+        "Grype"
+      ],
+      "id": "F-0014"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2018-18074",
+      "title": "PYSEC-2018-28",
+      "severity": "high",
+      "cwe": "",
+      "package": "requests",
+      "version": "2.9.2",
+      "ecosystem": "PyPI",
+      "fixed": "2.20.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "The Requests package through 2.19.1 before 2018-09-14 for Python sends an HTTP Authorization header to an http URI upon receiving a same-hostname https-to-http redirect, which makes it easier for remote attackers to discover credentials by sniffing the network.",
+      "aliases": [
+        "CVE-2018-18074",
+        "GHSA-x84v-xcm2-53pg"
+      ],
+      "sources": [
+        "OSV-Scanner"
+      ],
+      "id": "F-0015"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2023-32681",
+      "title": "PYSEC-2023-74",
+      "severity": "high",
+      "cwe": "",
+      "package": "requests",
+      "version": "2.9.2",
+      "ecosystem": "PyPI",
+      "fixed": "2.31.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "Requests is a HTTP library. Since Requests 2.3.0, Requests has been leaking Proxy-Authorization headers to destination servers when redirected to an HTTPS endpoint. This is a product of how we use `rebuild_proxies` to reattach the `Proxy-Authorization` header to requests. For HTTP connections sent t",
+      "aliases": [
+        "CVE-2023-32681",
+        "GHSA-j8r2-6x86-q33q"
+      ],
+      "sources": [
+        "OSV-Scanner"
+      ],
+      "id": "F-0016"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2024-47081",
+      "title": "Requests vulnerable to .netrc credentials leak via malicious URLs",
+      "severity": "high",
+      "cwe": "",
+      "package": "requests",
+      "version": "2.9.2",
+      "ecosystem": "PyPI",
+      "fixed": "2.32.4",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "### Impact\n\nDue to a URL parsing issue, Requests releases prior to 2.32.4 may leak .netrc credentials to third parties for specific maliciously-crafted URLs.\n\n### Workarounds\nFor older versions of Requests, use of the .netrc file can be disabled with `trust_env=False` on your Requests Session ([docs",
+      "aliases": [
+        "CVE-2024-47081",
+        "GHSA-9hjg-9r4m-mvj7"
+      ],
+      "sources": [
+        "OSV-Scanner"
+      ],
+      "id": "F-0017"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2024-35195",
+      "title": "Requests `Session` object does not verify requests after making first request with verify=False",
+      "severity": "high",
+      "cwe": "",
+      "package": "requests",
+      "version": "2.9.2",
+      "ecosystem": "PyPI",
+      "fixed": "2.32.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "When using a `requests.Session`, if the first request to a given origin is made with `verify=False`, TLS certificate verification may remain disabled for all subsequent requests to that origin, even if `verify=True` is explicitly specified later.\n\nThis occurs because the underlying connection is reu",
+      "aliases": [
+        "CVE-2024-35195",
+        "GHSA-9wx4-h78v-vm56"
+      ],
+      "sources": [
+        "OSV-Scanner"
+      ],
+      "id": "F-0018"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-25645",
+      "title": "PYSEC-2026-2275",
+      "severity": "high",
+      "cwe": "",
+      "package": "requests",
+      "version": "2.9.2",
+      "ecosystem": "PyPI",
+      "fixed": "2.33.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "Requests is a HTTP library. Prior to version 2.33.0, the `requests.utils.extract_zipped_paths()` utility function uses a predictable filename when extracting files from zip archives into the system temporary directory. If the target file already exists, it is reused without validation. A local attac",
+      "aliases": [
+        "CVE-2026-25645",
+        "GHSA-gc5v-m9x4-r6x2"
+      ],
+      "sources": [
+        "OSV-Scanner"
+      ],
+      "id": "F-0019"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2023-46136",
+      "title": "PYSEC-2023-221",
+      "severity": "high",
+      "cwe": "",
+      "package": "werkzeug",
+      "version": "2.2.3",
+      "ecosystem": "PyPI",
+      "fixed": "3.0.1",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "Werkzeug is a comprehensive WSGI web application library. If an upload of a file that starts with CR or LF and then is followed by megabytes of data without these characters: all of these bytes are appended chunk by chunk into internal bytearray and lookup for boundary is performed on growing buffer",
+      "aliases": [
+        "CVE-2023-46136",
+        "GHSA-hrfv-mqp8-q5rw"
+      ],
+      "sources": [
+        "OSV-Scanner"
+      ],
+      "id": "F-0020"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2024-34069",
+      "title": "Werkzeug debugger vulnerable to remote execution when interacting with attacker controlled domain",
+      "severity": "high",
+      "cwe": "",
+      "package": "werkzeug",
+      "version": "2.2.3",
+      "ecosystem": "PyPI",
+      "fixed": "3.0.3",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "The debugger in affected versions of Werkzeug can allow an attacker to execute code on a developer's machine under some circumstances. This requires the attacker to get the developer to interact with a domain and subdomain they control, and enter the debugger PIN, but if they are successful it allow",
+      "aliases": [
+        "CVE-2024-34069",
+        "GHSA-2g68-c3qc-8985"
+      ],
+      "sources": [
+        "OSV-Scanner"
+      ],
+      "id": "F-0021"
+    },
+    {
+      "category": "Secrets",
+      "source": "Gitleaks",
+      "rule": "jwt",
+      "title": "Uncovered a JSON Web Token, which may lead to unauthorized access to web applications and sensitive user data.",
+      "severity": "high",
+      "cwe": "CWE-798",
+      "file": "openapi_specs/openapi3.yml",
+      "line": 181,
+      "description": "Значение скрыто (redact); совпадение по отпечатку c300e2bc404937458308545e",
+      "sources": [
+        "Gitleaks"
+      ],
+      "id": "F-0022"
+    },
+    {
+      "category": "SAST",
+      "source": "Semgrep",
+      "rule": "missing-user-entrypoint",
+      "title": "By not specifying a USER, a program in the container may run as 'root'. This is a security hazard. If an attacker can control a process running as root, they may have control over the container. Ensur",
+      "severity": "medium",
+      "cwe": "CWE-269",
+      "file": "Dockerfile",
+      "line": 16,
+      "description": "By not specifying a USER, a program in the container may run as 'root'. This is a security hazard. If an attacker can control a process running as root, they may have control over the container. Ensure that the last USER in a Dockerfile is a USER other than 'root'.",
+      "sources": [
+        "Semgrep"
+      ],
+      "id": "F-0023"
+    },
+    {
+      "category": "SAST",
+      "source": "Semgrep",
+      "rule": "missing-user",
+      "title": "By not specifying a USER, a program in the container may run as 'root'. This is a security hazard. If an attacker can control a process running as root, they may have control over the container. Ensur",
+      "severity": "medium",
+      "cwe": "CWE-250",
+      "file": "Dockerfile",
+      "line": 17,
+      "description": "By not specifying a USER, a program in the container may run as 'root'. This is a security hazard. If an attacker can control a process running as root, they may have control over the container. Ensure that the last USER in a Dockerfile is a USER other than 'root'.",
+      "sources": [
+        "Semgrep"
+      ],
+      "id": "F-0024"
+    },
+    {
+      "category": "SAST",
+      "source": "CodeQL",
+      "rule": "redos",
+      "title": "This part of the regular expression may cause exponential backtracking on strings starting with '0' and containing many repetitions of '0'.",
+      "severity": "medium",
+      "cwe": "",
+      "file": "api_views/users.py",
+      "line": 145,
+      "description": "This part of the regular expression may cause exponential backtracking on strings starting with '0' and containing many repetitions of '0'.",
+      "sources": [
+        "CodeQL"
+      ],
+      "id": "F-0025"
+    },
+    {
+      "category": "SAST",
+      "source": "CodeQL",
+      "rule": "polynomial-redos",
+      "title": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '0' and with many repetitions of '0'.",
+      "severity": "medium",
+      "cwe": "",
+      "file": "api_views/users.py",
+      "line": 146,
+      "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '0' and with many repetitions of '0'.",
+      "sources": [
+        "CodeQL"
+      ],
+      "id": "F-0026"
+    },
+    {
+      "category": "SAST",
+      "source": "CodeQL",
+      "rule": "polynomial-redos",
+      "title": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '0' and with many repetitions of '00'.",
+      "severity": "medium",
+      "cwe": "",
+      "file": "api_views/users.py",
+      "line": 163,
+      "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '0' and with many repetitions of '00'.",
+      "sources": [
+        "CodeQL"
+      ],
+      "id": "F-0027"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-48522",
+      "title": "PYSEC-2026-175",
+      "severity": "medium",
+      "cwe": "",
+      "package": "pyjwt",
+      "version": "2.6.0",
+      "ecosystem": "PyPI",
+      "fixed": "2.13.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "PyJWT is a JSON Web Token implementation in Python. Prior to 2.13.0, PyJWKClient passes its uri argument directly to urllib.request.urlopen() which uses Python stdlib's default OpenerDirector registering HTTPHandler, HTTPSHandler, FTPHandler, FileHandler, and DataHandler. There is currently no docum",
+      "aliases": [
+        "CVE-2026-48522",
+        "GHSA-993g-76c3-p5m4"
+      ],
+      "sources": [
+        "OSV-Scanner",
+        "Grype"
+      ],
+      "id": "F-0028"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-48524",
+      "title": "PYSEC-2026-177",
+      "severity": "medium",
+      "cwe": "",
+      "package": "pyjwt",
+      "version": "2.6.0",
+      "ecosystem": "PyPI",
+      "fixed": "2.13.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "PyJWT is a JSON Web Token implementation in Python. Prior to 2.13.0, PyJWKClient.get_signing_key() forces a fresh HTTP request to the JWKS endpoint for every JWT with an unknown kid value, with no rate limiting. Since kid comes from the unverified token header, an attacker can trigger unlimited outb",
+      "aliases": [
+        "CVE-2026-48524",
+        "GHSA-fhv5-28vv-h8m8"
+      ],
+      "sources": [
+        "OSV-Scanner",
+        "Grype"
+      ],
+      "id": "F-0029"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-101917",
+      "title": "PyJWT: PyJWKClient still amplifies unauthenticated JWKS fetches on unknown kid values (incomplete fix of CVE-2026-48524)",
+      "severity": "medium",
+      "cwe": "",
+      "package": "pyjwt",
+      "version": "2.6.0",
+      "ecosystem": "PyPI",
+      "fixed": "2.14.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "Summary\nCVE-2026-48524 (GHSA-fhv5-28vv-h8m8, \"PyJWKClient unbounded JWKS endpoint requests via attacker-controlled kid values (DoS)\") was fixed in 2.13.0 by stopping fetch_data() from clearing the cache on a fetch error. That closed one amplification path but did not add the mitigation the advisory'",
+      "aliases": [
+        "CVE-2026-101917",
+        "GHSA-2gx3-rcp4-g85q"
+      ],
+      "sources": [
+        "OSV-Scanner",
+        "Grype"
+      ],
+      "id": "F-0030"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-101918",
+      "title": "PyJWT: Unauthenticated RecursionError DoS in pre-verification payload parse (PyJWKClient.get_signing_key_from_jwt / verify_signature=False)",
+      "severity": "medium",
+      "cwe": "",
+      "package": "pyjwt",
+      "version": "2.6.0",
+      "ecosystem": "PyPI",
+      "fixed": "2.15.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "## Summary\n\n`PyJWKClient.get_signing_key_from_jwt(token)` — the first step of the JWKS\nverification flow documented in `docs/usage.rst` — must decode a token's\npayload before its signature can be checked, via\n`jwt.api_jwt.decode_complete(token, options={\"verify_signature\": False})`.\nThat call parses",
+      "aliases": [
+        "CVE-2026-101918",
+        "GHSA-42vr-xj54-vc7v"
+      ],
+      "sources": [
+        "OSV-Scanner",
+        "Grype"
+      ],
+      "id": "F-0031"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-102269",
+      "title": "PyJWT: Non-canonical signature segments enable raw-token revocation bypass",
+      "severity": "medium",
+      "cwe": "",
+      "package": "pyjwt",
+      "version": "2.6.0",
+      "ecosystem": "PyPI",
+      "fixed": "2.14.0",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "## Summary\n\nPyJWT 2.13.0 accepts compact JWS signature segments containing characters that\nare not in the Base64URL alphabet. Appending `!!!!` to a valid signature does\nnot change the decoded signature bytes or authenticated claims, but it changes\nthe serialized token and its SHA-256 hash. An applic",
+      "aliases": [
+        "CVE-2026-102269",
+        "GHSA-hxm8-2xgr-2p9m"
+      ],
+      "sources": [
+        "OSV-Scanner",
+        "Grype"
+      ],
+      "id": "F-0032"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-27205",
+      "title": "PYSEC-2026-2151",
+      "severity": "medium",
+      "cwe": "",
+      "package": "flask",
+      "version": "2.2.2",
+      "ecosystem": "PyPI",
+      "fixed": "3.1.3",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "Flask is a web server gateway interface (WSGI) web application framework. In versions 3.1.2 and below, when the session object is accessed, Flask should set the Vary: Cookie header., resulting in a Use of Cache Containing Sensitive Information vulnerability. The logic instructs caches not to cache t",
+      "aliases": [
+        "CVE-2026-27205",
+        "GHSA-68rp-wp8r-4726"
+      ],
+      "sources": [
+        "OSV-Scanner",
+        "Grype"
+      ],
+      "id": "F-0033"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-21860",
+      "title": " Werkzeug safe_join() allows Windows special device names with compound extensions",
+      "severity": "medium",
+      "cwe": "",
+      "package": "werkzeug",
+      "version": "2.2.3",
+      "ecosystem": "PyPI",
+      "fixed": "3.1.5",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "Werkzeug's `safe_join` function allows path segments with Windows device names that have file extensions or trailing spaces. On Windows, there are special device names such as `CON`, `AUX`, etc that are implicitly present and readable in every directory. Windows still accepts them with any file exte",
+      "aliases": [
+        "CVE-2026-21860",
+        "GHSA-87hc-h4r5-73f7"
+      ],
+      "sources": [
+        "OSV-Scanner"
+      ],
+      "id": "F-0034"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2024-49766",
+      "title": "Werkzeug safe_join not safe on Windows",
+      "severity": "medium",
+      "cwe": "",
+      "package": "werkzeug",
+      "version": "2.2.3",
+      "ecosystem": "PyPI",
+      "fixed": "3.0.6",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "On Python < 3.11 on Windows, `os.path.isabs()` does not catch UNC paths like `//server/share`. Werkzeug's `safe_join()` relies on this check, and so can produce a path that is not safe, potentially allowing unintended access to data. Applications using Python >= 3.11, or not using Windows, are not v",
+      "aliases": [
+        "CVE-2024-49766",
+        "GHSA-f9vj-2wh5-fj8j"
+      ],
+      "sources": [
+        "OSV-Scanner"
+      ],
+      "id": "F-0035"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2025-66221",
+      "title": "Werkzeug safe_join() allows Windows special device names",
+      "severity": "medium",
+      "cwe": "",
+      "package": "werkzeug",
+      "version": "2.2.3",
+      "ecosystem": "PyPI",
+      "fixed": "3.1.4",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "Werkzeug's `safe_join` function allows path segments with Windows device names. On Windows, there are special device names such as `CON`, `AUX`, etc that are implicitly present and readable in every directory. `send_from_directory` uses `safe_join` to safely serve files at user-specified paths under",
+      "aliases": [
+        "CVE-2025-66221",
+        "GHSA-hgf8-39gv-g3f2"
+      ],
+      "sources": [
+        "OSV-Scanner"
+      ],
+      "id": "F-0036"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-27199",
+      "title": "PYSEC-2026-2320",
+      "severity": "medium",
+      "cwe": "",
+      "package": "werkzeug",
+      "version": "2.2.3",
+      "ecosystem": "PyPI",
+      "fixed": "3.1.6",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "Werkzeug is a comprehensive WSGI web application library. Versions 3.1.5 and below, the safe_join function allows Windows device names as filenames if preceded by other path segments. This was previously reported as GHSA-hgf8-39gv-g3f2, but the added filtering failed to account for the fact that saf",
+      "aliases": [
+        "CVE-2026-27199",
+        "GHSA-29vq-49wr-vm6x"
+      ],
+      "sources": [
+        "OSV-Scanner"
+      ],
+      "id": "F-0037"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2024-49767",
+      "title": "Werkzeug possible resource exhaustion when parsing file data in forms",
+      "severity": "medium",
+      "cwe": "",
+      "package": "werkzeug",
+      "version": "2.2.3",
+      "ecosystem": "PyPI",
+      "fixed": "3.0.6",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "Applications using Werkzeug to parse `multipart/form-data` requests are vulnerable to resource exhaustion. A specially crafted form body can bypass the `Request.max_form_memory_size` setting.\n\n\nThe `Request.max_content_length` setting, as well as resource limits provided by deployment software and p",
+      "aliases": [
+        "CVE-2024-49767",
+        "GHSA-q34m-jh98-gwm2",
+        "PYSEC-2026-1860"
+      ],
+      "sources": [
+        "OSV-Scanner"
+      ],
+      "id": "F-0038"
+    },
+    {
+      "category": "SCA",
+      "source": "OSV-Scanner",
+      "rule": "CVE-2026-102598",
+      "title": "Werkzeug safe_join() allows Windows special device names",
+      "severity": "medium",
+      "cwe": "",
+      "package": "werkzeug",
+      "version": "2.2.3",
+      "ecosystem": "PyPI",
+      "fixed": "3.1.9",
+      "file": "requirements.txt",
+      "line": "",
+      "description": "Werkzeug's `safe_join` function allows Windows device names as filenames when they have an empty ADS marker on NTFS.\n\nThis was previously reported as https://github.com/pallets/werkzeug/security/advisories/GHSA-hgf8-39gv-g3f2, but the added filtering failed to account for the fact Windows allows spe",
+      "aliases": [
+        "CVE-2026-102598",
+        "GHSA-g6x2-hccm-hh4m"
+      ],
+      "sources": [
+        "OSV-Scanner"
+      ],
+      "id": "F-0039"
+    },
+    {
+      "category": "SAST",
+      "source": "Semgrep",
+      "rule": "avoid_hardcoded_config_SECRET_KEY",
+      "title": "Hardcoded variable `SECRET_KEY` detected. Use environment variables or config files instead",
+      "severity": "low",
+      "cwe": "CWE-489",
+      "file": "config.py",
+      "line": 13,
+      "description": "Hardcoded variable `SECRET_KEY` detected. Use environment variables or config files instead",
+      "sources": [
+        "Semgrep"
+      ],
+      "id": "F-0040"
+    }
+  ]
+}

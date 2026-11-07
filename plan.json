@@ -1,0 +1,84 @@
+{
+  "target": "/tmp/vampi",
+  "facts": {
+    "files_total": 22,
+    "languages": [
+      {
+        "key": "python",
+        "name": "Python",
+        "files": 11,
+        "codeql": "python"
+      }
+    ],
+    "codeql_languages": [
+      "python"
+    ],
+    "manifests": [
+      "requirements.txt"
+    ],
+    "lockfiles": [],
+    "ecosystems": [
+      "PyPI"
+    ],
+    "has_dockerfile": true,
+    "has_compose": true,
+    "git": {
+      "present": true,
+      "commits": 68
+    }
+  },
+  "tools": {
+    "semgrep": {
+      "run": true,
+      "category": "SAST",
+      "reason": "Обнаружен исходный код (Python); наборы правил: p/security-audit, p/secrets, p/owasp-top-ten, p/python, p/docker",
+      "configs": [
+        "p/security-audit",
+        "p/secrets",
+        "p/owasp-top-ten",
+        "p/python",
+        "p/docker"
+      ]
+    },
+    "codeql": {
+      "run": true,
+      "category": "SAST",
+      "reason": "Языки с поддержкой анализа потока данных CodeQL: python",
+      "languages": [
+        "python"
+      ]
+    },
+    "gitleaks": {
+      "run": true,
+      "category": "Secrets",
+      "mode": "git",
+      "reason": "Сканирование истории git (68 коммитов); детекторы по известным шаблонам ключей и generic-правилам"
+    },
+    "trufflehog": {
+      "run": true,
+      "category": "Secrets",
+      "mode": "git",
+      "reason": "Второй, независимый набор детекторов сервисов (верификация отключена: найденные значения не проверяются на стороне сервисов и не попадают в отчёт)"
+    },
+    "cdxgen": {
+      "run": true,
+      "category": "SBOM",
+      "reason": "Манифесты зависимостей: requirements.txt — SBOM строится из графа зависимостей исходного кода"
+    },
+    "syft": {
+      "run": true,
+      "category": "SBOM",
+      "reason": "Инвентаризация файловой системы проекта целиком, включая Docker-образ из Dockerfile — покрывает пакеты ОС, бинарные артефакты и зависимости вне манифестов"
+    },
+    "osv-scanner": {
+      "run": true,
+      "category": "SCA",
+      "reason": "Экосистемы зависимостей: PyPI; сверка lock-файлов и манифестов с базой OSV"
+    },
+    "grype": {
+      "run": true,
+      "category": "SCA",
+      "reason": "Анализ SBOM (Syft, при наличии — также cdxgen): уязвимости пакетов ОС и зависимостей, не попавших в lock-файлы"
+    }
+  }
+}

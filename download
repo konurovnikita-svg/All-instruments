@@ -1,0 +1,3 @@
+security-results/
+__pycache__/
+*.pyc
