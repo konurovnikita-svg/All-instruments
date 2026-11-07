@@ -1,5 +1,5 @@
 # =============================================================================
-# Security Pipeline — автономный workflow (один файл на весь пайплайн)
+# Security Pipeline — автономный workflow 
 #
 # Что делает:
 #   job setup   — сам создаёт папки scripts/, config/, examples/ и записывает
@@ -9,9 +9,6 @@
 #                 SBOM (cdxgen, Syft), SCA (OSV-Scanner, Grype);
 #   job report  — единый отчёт (report.html / report.md / findings.json) + gate.
 #
-# Установка: положить этот файл в .github/workflows/security-pipeline.yml
-# и запустить через Actions -> Security Pipeline -> Run workflow.
-# Ничего больше заливать не нужно.
 # =============================================================================
 name: Security Pipeline
 
