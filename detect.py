@@ -18,7 +18,7 @@ import argparse, json, os, subprocess, sys
 from collections import Counter
 from pathlib import Path
 
-# --- языки: расширение -> (ключ, CodeQL language | None, отображаемое имя) ---
+
 LANG_BY_EXT = {
     '.js': ('javascript-typescript', 'javascript-typescript', 'JavaScript/TypeScript'),
     '.jsx': ('javascript-typescript', 'javascript-typescript', 'JavaScript/TypeScript'),
@@ -59,7 +59,7 @@ MANIFESTS = {
 LOCKFILES = {'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'Pipfile.lock',
              'poetry.lock', 'Gemfile.lock', 'go.sum', 'composer.lock', 'Cargo.lock'}
 
-# наборы правил Semgrep под язык (registry packs)
+
 SEMGREP_PACKS = {
     'javascript-typescript': 'p/javascript',
     'python': 'p/python',
