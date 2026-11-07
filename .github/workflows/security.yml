@@ -1,0 +1,1343 @@
+# =============================================================================
+# Security Pipeline — автономный workflow (один файл на весь пайплайн)
+#
+# Что делает:
+#   job setup   — сам создаёт папки scripts/, config/, examples/ и записывает
+#                 в них скрипты пайплайна, коммитит структуру в репозиторий;
+#   job detect  — определяет языки и структуру проекта, выбирает инструменты;
+#   далее       — SAST (Semgrep, CodeQL), secret scanning (Gitleaks, TruffleHog),
+#                 SBOM (cdxgen, Syft), SCA (OSV-Scanner, Grype);
+#   job report  — единый отчёт (report.html / report.md / findings.json) + gate.
+#
+# Установка: положить этот файл в .github/workflows/security-pipeline.yml
+# и запустить через Actions -> Security Pipeline -> Run workflow.
+# Ничего больше заливать не нужно.
+# =============================================================================
+name: Security Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repository:
+        description: 'Репозиторий для проверки (owner/repo). Пусто — этот репозиторий'
+        required: false
+        type: string
+        default: ''
+      target_ref:
+        description: 'Ветка, тег или SHA цели. Пусто — ветка по умолчанию'
+        required: false
+        type: string
+        default: ''
+      fail_on:
+        description: 'Quality gate: падать при находках не ниже уровня'
+        required: true
+        type: choice
+        options: [none, medium, high, critical]
+        default: high
+
+permissions:
+  contents: write          # job setup коммитит созданную структуру
+  security-events: write
+  actions: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RESULTS_DIR: security-results
+  GATE: ${{ inputs.fail_on || 'high' }}
+
+jobs:
+  # ------------------------------------------------------------- setup папок
+  setup:
+    name: 'Этап 0 · Создание структуры пайплайна'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Create folders and pipeline scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p scripts config examples/dvna examples/vampi
+          cat > scripts/detect.py <<'EOF_DETECT_PY'
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+          """
+          Детектор проекта: определяет языки, экосистемы зависимостей и структуру
+          репозитория и на этом основании выбирает инструменты для пайплайна.
+
+          Результат — plan.json:
+            * какие инструменты запускать (и почему);
+            * какие — нет (и почему);
+            * языки CodeQL для динамической матрицы GitHub Actions.
+
+          Использование:
+              python3 detect.py --target ./target --out plan.json
+          В GitHub Actions дополнительно пишет outputs (steps.<id>.outputs.*),
+          если задан $GITHUB_OUTPUT.
+          """
+          import argparse, json, os, subprocess, sys
+          from collections import Counter
+          from pathlib import Path
+
+          # --- языки: расширение -> (ключ, CodeQL language | None, отображаемое имя) ---
+          LANG_BY_EXT = {
+              '.js': ('javascript-typescript', 'javascript-typescript', 'JavaScript/TypeScript'),
+              '.jsx': ('javascript-typescript', 'javascript-typescript', 'JavaScript/TypeScript'),
+              '.mjs': ('javascript-typescript', 'javascript-typescript', 'JavaScript/TypeScript'),
+              '.cjs': ('javascript-typescript', 'javascript-typescript', 'JavaScript/TypeScript'),
+              '.ts': ('javascript-typescript', 'javascript-typescript', 'JavaScript/TypeScript'),
+              '.tsx': ('javascript-typescript', 'javascript-typescript', 'JavaScript/TypeScript'),
+              '.py': ('python', 'python', 'Python'),
+              '.java': ('java-kotlin', 'java-kotlin', 'Java/Kotlin'),
+              '.kt': ('java-kotlin', 'java-kotlin', 'Java/Kotlin'),
+              '.kts': ('java-kotlin', 'java-kotlin', 'Java/Kotlin'),
+              '.rb': ('ruby', 'ruby', 'Ruby'),
+              '.erb': ('ruby', 'ruby', 'Ruby'),
+              '.cs': ('csharp', 'csharp', 'C#'),
+              '.go': ('go', 'go', 'Go'),
+              '.php': ('php', None, 'PHP'),
+              '.c': ('cpp', 'cpp', 'C/C++'),
+              '.h': ('cpp', 'cpp', 'C/C++'),
+              '.cpp': ('cpp', 'cpp', 'C/C++'),
+              '.swift': ('swift', 'swift', 'Swift'),
+              '.sh': ('shell', None, 'Shell'),
+              '.tf': ('terraform', None, 'Terraform'),
+          }
+
+          # --- экосистемы зависимостей: манифест -> экосистема ---
+          MANIFESTS = {
+              'package.json': 'npm', 'package-lock.json': 'npm', 'yarn.lock': 'npm',
+              'pnpm-lock.yaml': 'npm',
+              'requirements.txt': 'PyPI', 'requirements-dev.txt': 'PyPI',
+              'Pipfile': 'PyPI', 'Pipfile.lock': 'PyPI', 'pyproject.toml': 'PyPI',
+              'poetry.lock': 'PyPI', 'setup.py': 'PyPI',
+              'pom.xml': 'Maven', 'build.gradle': 'Maven', 'build.gradle.kts': 'Maven',
+              'Gemfile': 'RubyGems', 'Gemfile.lock': 'RubyGems',
+              'go.mod': 'Go', 'go.sum': 'Go',
+              'composer.json': 'Packagist', 'composer.lock': 'Packagist',
+              'Cargo.toml': 'crates.io', 'Cargo.lock': 'crates.io',
+          }
+          LOCKFILES = {'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'Pipfile.lock',
+                       'poetry.lock', 'Gemfile.lock', 'go.sum', 'composer.lock', 'Cargo.lock'}
+
+          # наборы правил Semgrep под язык (registry packs)
+          SEMGREP_PACKS = {
+              'javascript-typescript': 'p/javascript',
+              'python': 'p/python',
+              'java-kotlin': 'p/java',
+              'ruby': 'p/ruby',
+              'csharp': 'p/csharp',
+              'go': 'p/golang',
+              'php': 'p/php',
+              'terraform': 'p/terraform',
+          }
+
+          SKIP_DIRS = {'.git', 'node_modules', 'vendor', 'dist', 'build', 'target',
+                       '.venv', 'venv', '__pycache__', '.tox', 'site-packages'}
+
+
+          def scan(target: Path):
+              ext_counter, manifests, lockfiles = Counter(), [], []
+              dockerfile = compose = False
+              file_total = 0
+              for root, dirs, names in os.walk(target):
+                  dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                  for name in names:
+                      file_total += 1
+                      low = name.lower()
+                      if low in MANIFESTS:
+                          manifests.append(name)
+                          if low in LOCKFILES:
+                              lockfiles.append(name)
+                      if low == 'dockerfile' or low.startswith('dockerfile.'):
+                          dockerfile = True
+                      if low.startswith('docker-compose'):
+                          compose = True
+                      ext = Path(name).suffix.lower()
+                      if ext in LANG_BY_EXT:
+                          ext_counter[LANG_BY_EXT[ext][0]] += 1
+              languages = []
+              codeql_languages = []
+              for key, n in ext_counter.most_common():
+                  cq = next(v[1] for v in LANG_BY_EXT.values() if v[0] == key)
+                  display = next(v[2] for v in LANG_BY_EXT.values() if v[0] == key)
+                  languages.append({'key': key, 'name': display, 'files': n, 'codeql': cq})
+                  if cq and cq not in codeql_languages:
+                      codeql_languages.append(cq)
+              ecosystems = sorted({MANIFESTS[m.lower()] for m in manifests})
+              git = (target / '.git').exists()
+              commits = 0
+              if git:
+                  try:
+                      out = subprocess.run(['git', '-C', str(target), 'rev-list', '--count', 'HEAD'],
+                                           capture_output=True, text=True, timeout=30)
+                      commits = int(out.stdout.strip() or 0)
+                  except Exception:
+                      commits = 0
+              return {
+                  'files_total': file_total,
+                  'languages': languages,
+                  'codeql_languages': codeql_languages,
+                  'manifests': sorted(set(manifests)),
+                  'lockfiles': sorted(set(lockfiles)),
+                  'ecosystems': ecosystems,
+                  'has_dockerfile': dockerfile,
+                  'has_compose': compose,
+                  'git': {'present': git, 'commits': commits},
+              }
+
+
+          def decide(f):
+              """Правила выбора инструментов. Каждый инструмент — run + обоснование."""
+              langs = f['languages']
+              lang_keys = [l['key'] for l in langs]
+              has_code = bool(langs)
+              has_manifests = bool(f['manifests'])
+              tools = {}
+
+              # ---- SAST -------------------------------------------------------------
+              packs = ['p/security-audit', 'p/secrets', 'p/owasp-top-ten']
+              for k in lang_keys:
+                  if k in SEMGREP_PACKS and SEMGREP_PACKS[k] not in packs:
+                      packs.append(SEMGREP_PACKS[k])
+              if f['has_dockerfile']:
+                  packs.append('p/docker')
+              tools['semgrep'] = {
+                  'run': has_code, 'category': 'SAST',
+                  'reason': ('Обнаружен исходный код (%s); наборы правил: %s'
+                             % (', '.join(l['name'] for l in langs), ', '.join(packs))) if has_code
+                            else 'Исходный код поддерживаемых языков не обнаружен',
+                  'configs': packs if has_code else [],
+              }
+              cq = f['codeql_languages']
+              tools['codeql'] = {
+                  'run': bool(cq), 'category': 'SAST',
+                  'reason': ('Языки с поддержкой анализа потока данных CodeQL: %s'
+                             % ', '.join(cq)) if cq else
+                            'Языки CodeQL в проекте не обнаружены (например, PHP CodeQL не поддерживает) — '
+                            'SAST закрывает Semgrep',
+                  'languages': cq,
+              }
+
+              # ---- Secret scanning ---------------------------------------------------
+              git_mode = f['git']['present'] and f['git']['commits'] > 0
+              tools['gitleaks'] = {
+                  'run': True, 'category': 'Secrets',
+                  'mode': 'git' if git_mode else 'dir',
+                  'reason': 'Сканирование %s; детекторы по известным шаблонам ключей и generic-правилам'
+                            % ('истории git (%d коммитов)' % f['git']['commits'] if git_mode
+                               else 'рабочего дерева (история git недоступна)'),
+              }
+              tools['trufflehog'] = {
+                  'run': True, 'category': 'Secrets',
+                  'mode': 'git' if git_mode else 'filesystem',
+                  'reason': 'Второй, независимый набор детекторов сервисов (верификация отключена: '
+                            'найденные значения не проверяются на стороне сервисов и не попадают в отчёт)',
+              }
+
+              # ---- SBOM ---------------------------------------------------------------
+              tools['cdxgen'] = {
+                  'run': has_manifests, 'category': 'SBOM',
+                  'reason': ('Манифесты зависимостей: %s — SBOM строится из графа зависимостей исходного кода'
+                             % ', '.join(f['manifests'])) if has_manifests
+                            else 'Манифесты зависимостей не обнаружены — SBOM из исходного графа не построить',
+              }
+              tools['syft'] = {
+                  'run': True, 'category': 'SBOM',
+                  'reason': 'Инвентаризация файловой системы проекта целиком%s — покрывает пакеты ОС, '
+                            'бинарные артефакты и зависимости вне манифестов'
+                            % (', включая Docker-образ из Dockerfile' if f['has_dockerfile'] else ''),
+              }
+
+              # ---- SCA ----------------------------------------------------------------
+              tools['osv-scanner'] = {
+                  'run': has_manifests, 'category': 'SCA',
+                  'reason': ('Экосистемы зависимостей: %s; сверка lock-файлов и манифестов с базой OSV'
+                             % ', '.join(f['ecosystems'])) if has_manifests
+                            else 'Зависимости по манифестам не заявлены — сверять с базой OSV нечего',
+              }
+              tools['grype'] = {
+                  'run': True, 'category': 'SCA',
+                  'reason': 'Анализ SBOM (Syft, при наличии — также cdxgen): уязвимости пакетов ОС и '
+                            'зависимостей, не попавших в lock-файлы',
+              }
+              return tools
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument('--target', required=True)
+              ap.add_argument('--out', default='plan.json')
+              args = ap.parse_args()
+              target = Path(args.target).resolve()
+              facts = scan(target)
+              plan = {'target': str(target), 'facts': facts, 'tools': decide(facts)}
+              Path(args.out).write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding='utf-8')
+              print(json.dumps(plan, ensure_ascii=False, indent=2))
+
+              gh_out = os.environ.get('GITHUB_OUTPUT')
+              if gh_out:
+                  tools = plan['tools']
+                  with open(gh_out, 'a', encoding='utf-8') as fh:
+                      fh.write('plan<<EOF\n%s\nEOF\n' % json.dumps(plan, ensure_ascii=False))
+                      fh.write('codeql_matrix=%s\n' % json.dumps(
+                          [{'language': l} for l in tools['codeql']['languages']]))
+                      for name, t in tools.items():
+                          fh.write('%s=%s\n' % (name.replace('-', '_'), str(t['run']).lower()))
+              return 0
+
+
+          if __name__ == '__main__':
+              sys.exit(main())
+          EOF_DETECT_PY
+          cat > scripts/normalize_report.py <<'EOF_NORMALIZE_PY'
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+          """
+          Нормализация результатов всех сканеров в единый реестр находок и отчёт.
+
+          Читает сырые отчёты из каталога raw/ (любой файл может отсутствовать —
+          инструмент просто не был выбран детектором), план из plan.json и пишет:
+            * findings.json  — единый реестр (машиночитаемый);
+            * report.md      — отчёт для GitHub Job Summary / репозитория;
+            * report.html    — автономный красивый отчёт (inline CSS, без сети).
+
+          Дедупликация — внутри каждой категории:
+            * SAST:    один файл+строка+CWE от Semgrep и CodeQL = одна находка, источники оба;
+            * Secrets: один файл+строка+детектор = одна находка (значения секретов в отчёт не попадают);
+            * SCA:     один пакет+версия+CVE (с учётом алиасов GHSA) от OSV и Grype = одна находка.
+
+          Политика качества (gate): --fail-on critical|high|medium|none —
+          код возврата 1, если есть находки не ниже порога (по умолчанию отчёт не валит сборку).
+          """
+          import argparse, html, json, re, sys
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          SEV_ORDER = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
+          SEV_RU = {'critical': 'Критический', 'high': 'Высокий', 'medium': 'Средний',
+                    'low': 'Низкий', 'info': 'Инфо'}
+
+          REMEDIATION = {
+              'SAST': 'Исправить код в указанном месте; для инъекций — параметризованные запросы и '
+                      'валидация входных данных, для вывода — контекстное экранирование.',
+              'Secrets': 'Отозвать и перевыпустить скомпрометированное значение, удалить его из кода и '
+                         'истории git, перенести секрет в хранилище секретов (CI secrets / Vault).',
+              'SCA': 'Обновить пакет до исправленной версии (колонка «Исправлено в»); если обновления нет — '
+                     'оценить достижимость уязвимости и зафиксировать риск.',
+          }
+
+
+          def sev_from_score(score):
+              try:
+                  s = float(score)
+              except (TypeError, ValueError):
+                  return 'medium'
+              return 'critical' if s >= 9 else 'high' if s >= 7 else 'medium' if s >= 4 else 'low'
+
+
+          def norm_sev(s, default='medium'):
+              if s is None:
+                  return default
+              s = str(s).lower()
+              for k in SEV_ORDER:
+                  if s.startswith(k) or (k == 'info' and s in ('note', 'informational', 'negligible')):
+                      return k
+              return {'error': 'high', 'warning': 'medium', 'critical': 'critical'}.get(s, default)
+
+
+          def cwe_of(text):
+              m = re.search(r'CWE-(\d+)', str(text or ''), re.I)
+              return f'CWE-{m.group(1)}' if m else ''
+
+
+          def load_json(path):
+              try:
+                  return json.loads(Path(path).read_text(encoding='utf-8', errors='replace'))
+              except Exception:
+                  return None
+
+
+          def first_existing(raw: Path, patterns):
+              for pat in patterns:
+                  hits = sorted(raw.glob(pat))
+                  if hits:
+                      return hits[0]
+              return None
+
+
+          # ---------------------------------------------------------------- парсеры
+          def parse_semgrep(path):
+              data = load_json(path) or {}
+              out = []
+              for r in data.get('results', []):
+                  meta = r.get('extra', {}).get('metadata', {})
+                  out.append({
+                      'category': 'SAST', 'source': 'Semgrep',
+                      'rule': r.get('check_id', '').split('.')[-1],
+                      'title': (r.get('extra', {}).get('message') or r.get('check_id', ''))[:200],
+                      'severity': norm_sev(meta.get('impact') or r.get('extra', {}).get('severity')),
+                      'cwe': cwe_of(json.dumps(meta.get('cwe', ''))),
+                      'file': r.get('path', ''), 'line': (r.get('start') or {}).get('line', ''),
+                      'description': (r.get('extra', {}).get('message') or '')[:400],
+                  })
+              return out
+
+
+          def parse_codeql(path):
+              data = load_json(path) or {}
+              out = []
+              for run in data.get('runs', []):
+                  rules = {}
+                  for rule in run.get('tool', {}).get('driver', {}).get('rules', []):
+                      props = rule.get('properties', {})
+                      rules[rule['id']] = {
+                          'cwe': cwe_of(' '.join(props.get('tags', [])) + ' ' + rule.get('id', '')),
+                          'sev': sev_from_score(props.get('security-severity')) if props.get('security-severity') else None,
+                          'name': rule.get('shortDescription', {}).get('text') or rule.get('name', ''),
+                      }
+                  for res in run.get('results', []):
+                      rid = res.get('ruleId', '')
+                      meta = rules.get(rid, {})
+                      loc = (res.get('locations') or [{}])[0].get('physicalLocation', {})
+                      out.append({
+                          'category': 'SAST', 'source': 'CodeQL', 'rule': rid.split('/')[-1],
+                          'title': (meta.get('name') or res.get('message', {}).get('text', ''))[:200],
+                          'severity': meta.get('sev') or norm_sev(res.get('level'), 'medium'),
+                          'cwe': meta.get('cwe', ''),
+                          'file': loc.get('artifactLocation', {}).get('uri', ''),
+                          'line': loc.get('region', {}).get('startLine', ''),
+                          'description': res.get('message', {}).get('text', '')[:400],
+                      })
+              return out
+
+
+          def parse_gitleaks(path):
+              data = load_json(path) or []
+              out = []
+              for r in data if isinstance(data, list) else []:
+                  out.append({
+                      'category': 'Secrets', 'source': 'Gitleaks', 'rule': r.get('RuleID', ''),
+                      'title': r.get('Description') or f"Секрет: {r.get('RuleID', '')}",
+                      'severity': 'high', 'cwe': 'CWE-798',
+                      'file': r.get('File', ''), 'line': r.get('StartLine', ''),
+                      'description': 'Значение скрыто (redact); совпадение по отпечатку ' +
+                                     str(r.get('Fingerprint', ''))[:24],
+                  })
+              return out
+
+
+          def parse_trufflehog(path):
+              out = []
+              try:
+                  lines = Path(path).read_text(encoding='utf-8', errors='replace').splitlines()
+              except Exception:
+                  return out
+              for ln in lines:
+                  try:
+                      r = json.loads(ln)
+                  except Exception:
+                      continue
+                  git_meta = (((r.get('SourceMetadata') or {}).get('Data') or {}).get('Git') or {})
+                  fs_meta = (((r.get('SourceMetadata') or {}).get('Data') or {}).get('Filesystem') or {})
+                  out.append({
+                      'category': 'Secrets', 'source': 'TruffleHog',
+                      'rule': r.get('DetectorName') or r.get('RuleID', ''),
+                      'title': f"Секрет сервиса: {r.get('DetectorName') or r.get('RuleID', '')}",
+                      'severity': 'high', 'cwe': 'CWE-798',
+                      'file': git_meta.get('file') or fs_meta.get('file') or r.get('File', ''),
+                      'line': git_meta.get('line') or fs_meta.get('line') or r.get('Line', ''),
+                      'description': 'Значение в отчёт не включается (REDACTED)' +
+                                     (f"; коммит {str(git_meta.get('commit'))[:8]}" if git_meta.get('commit') else ''),
+                  })
+              return out
+
+
+          def parse_osv(path):
+              data = load_json(path) or {}
+              out = []
+              for res in data.get('results', []):
+                  src = res.get('source', {}).get('path', '')
+                  for pkg in res.get('packages', []):
+                      p = pkg.get('package', {})
+                      for v in pkg.get('vulnerabilities', []):
+                          sev = 'medium'
+                          for s in v.get('severity', []):
+                              m = re.search(r'CVSS:[\d.]+/AV:[^/]*/AC:[^/]*/PR:[^/]*/UI:[^/]*/S:[^/]*/C:(\w)/I:(\w)/A:(\w)',
+                                            s.get('score', ''))
+                              sev = sev_from_score(_cvss_base(s.get('score', ''))) if s.get('score') else sev
+                          fixed = ''
+                          for aff in v.get('affected', []):
+                              for rng in aff.get('ranges', []):
+                                  for ev in rng.get('events', []):
+                                      if ev.get('fixed'):
+                                          fixed = ev['fixed']
+                          out.append({
+                              'category': 'SCA', 'source': 'OSV-Scanner',
+                              'rule': v.get('id', ''), 'title': v.get('summary') or v.get('id', ''),
+                              'severity': sev, 'cwe': cwe_of(json.dumps(v.get('database_specific', {}))),
+                              'package': p.get('name', ''), 'version': p.get('version', ''),
+                              'ecosystem': p.get('ecosystem', ''), 'fixed': fixed,
+                              'file': src, 'line': '',
+                              'description': (v.get('details') or '')[:300],
+                              'aliases': v.get('aliases', []),
+                          })
+              return out
+
+
+          def _cvss_base(vector):
+              # грубая оценка base score по вектору CVSS (только для градации отчёта)
+              impact = {'N': 0.0, 'L': 0.3, 'H': 0.6}
+              c = re.search(r'/C:(\w)', vector)
+              i = re.search(r'/I:(\w)', vector)
+              a = re.search(r'/A:(\w)', vector)
+              if not (c and i and a):
+                  return 5.0
+              base = 10 * max(impact.get(c.group(1), 0.3), impact.get(i.group(1), 0.3), impact.get(a.group(1), 0.3))
+              return min(10.0, base + 2.0)
+
+
+          def parse_grype(path):
+              data = load_json(path) or {}
+              out = []
+              for m in data.get('matches', []):
+                  v = m.get('vulnerability', {})
+                  art = m.get('artifact', {})
+                  fixed = ''
+                  fix = v.get('fix', {})
+                  if fix.get('versions'):
+                      fixed = fix['versions'][0]
+                  related = m.get('relatedVulnerabilities') or [{}]
+                  out.append({
+                      'category': 'SCA', 'source': 'Grype', 'rule': v.get('id', ''),
+                      'title': (related[0].get('description') or related[0].get('id') or v.get('id', ''))[:200],
+                      'severity': norm_sev(v.get('severity'), 'medium'),
+                      'cwe': cwe_of(' '.join(v.get('cwe', []) if isinstance(v.get('cwe'), list) else [str(v.get('cwe', ''))])),
+                      'package': art.get('name', ''), 'version': art.get('version', ''),
+                      'ecosystem': art.get('type', ''), 'fixed': fixed,
+                      'file': (art.get('locations') or [{}])[0].get('path', ''), 'line': '',
+                      'description': (related[0].get('description') or '')[:300],
+                      'aliases': [r.get('id') for r in related if r.get('id')],
+                  })
+              return out
+
+
+          def parse_sbom(path):
+              data = load_json(path) or {}
+              comps = data.get('components', [])
+              stats = {'components': len(comps),
+                       'ecosystems': Counter()}
+              names = []
+              for c in comps:
+                  purl = c.get('purl', '')
+                  eco = purl[4:].split('/')[0] if purl.startswith('pkg:') else c.get('type', '')
+                  stats['ecosystems'][eco] += 1
+                  names.append(f"{c.get('name', '')}@{c.get('version', '')}")
+              return {'stats': {'components': stats['components'],
+                                'ecosystems': dict(stats['ecosystems'])},
+                      'sample': sorted(names)[:15]}
+
+
+          PARSERS = [
+              ('Semgrep', 'SAST', ['semgrep/*.json', 'semgrep.json']),
+              ('CodeQL', 'SAST', ['codeql/**/*.sarif', 'codeql/*.sarif']),
+              ('Gitleaks', 'Secrets', ['gitleaks/results.json', 'gitleaks.json']),
+              ('TruffleHog', 'Secrets', ['trufflehog/results.json', 'trufflehog/*.json', 'trufflehog.jsonl']),
+              ('OSV-Scanner', 'SCA', ['osv/*.json', 'osv.json']),
+              ('Grype', 'SCA', ['grype/*.json', 'grype.json']),
+          ]
+          PARSE_FN = {'Semgrep': parse_semgrep, 'CodeQL': parse_codeql, 'Gitleaks': parse_gitleaks,
+                      'TruffleHog': parse_trufflehog, 'OSV-Scanner': parse_osv, 'Grype': parse_grype}
+
+
+          def dedup(findings):
+              merged = {}
+              for f in findings:
+                  if f['category'] == 'SAST':
+                      key = (f['category'], f.get('file', ''), str(f.get('line', '')),
+                             f.get('cwe') or f['rule'])
+                  elif f['category'] == 'Secrets':
+                      key = (f['category'], f.get('file', ''), str(f.get('line', '')),
+                             f['rule'].lower())
+                  else:
+                      ids = {f['rule']} | set(f.get('aliases') or [])
+                      cve = next((i for i in ids if str(i).startswith('CVE-')), f['rule'])
+                      key = (f['category'], f.get('package', ''), f.get('version', ''), cve)
+                      f['rule'] = cve
+                  if key in merged:
+                      m = merged[key]
+                      if f['source'] not in m['sources']:
+                          m['sources'].append(f['source'])
+                      if SEV_ORDER[f['severity']] < SEV_ORDER[m['severity']]:
+                          m['severity'] = f['severity']
+                      if not m.get('fixed') and f.get('fixed'):
+                          m['fixed'] = f['fixed']
+                      if len(f.get('description', '')) > len(m.get('description', '')):
+                          m['description'] = f['description']
+                  else:
+                      g = dict(f)
+                      g['sources'] = [f['source']]
+                      merged[key] = g
+              out = sorted(merged.values(),
+                           key=lambda x: (SEV_ORDER[x['severity']], x['category'],
+                                          x.get('file', ''), str(x.get('line', ''))))
+              for i, f in enumerate(out, 1):
+                  f['id'] = f"F-{i:04d}"
+              return out
+
+
+          # ---------------------------------------------------------------- отчёты
+          def plan_rows(plan):
+              labels = {'semgrep': 'Semgrep', 'codeql': 'CodeQL', 'gitleaks': 'Gitleaks',
+                        'trufflehog': 'TruffleHog', 'cdxgen': 'cdxgen', 'syft': 'Syft',
+                        'osv-scanner': 'OSV-Scanner', 'grype': 'Grype'}
+              rows = []
+              for key, t in plan.get('tools', {}).items():
+                  rows.append((labels.get(key, key), t.get('category', ''),
+                               'Запущен' if t.get('run') else 'Не выбран', t.get('reason', '')))
+              return rows
+
+
+          def build_md(meta, plan, tool_runs, findings, sbom_info):
+              sev = Counter(f['severity'] for f in findings)
+              cat = Counter(f['category'] for f in findings)
+              L = [f"# Отчёт проверки безопасности: {meta['project']}", '',
+                   f"**Дата:** {meta['generated_at']} · **Ветка/коммит:** {meta.get('ref', '—')} · "
+                   f"**Языки:** {', '.join(meta.get('languages', [])) or '—'}", '',
+                   '## Сводка', '',
+                   '| Категория | Находок | Критических | Высоких | Средних | Низких |',
+                   '|---|---:|---:|---:|---:|---:|']
+              for c in ('SAST', 'Secrets', 'SCA'):
+                  sub = [f for f in findings if f['category'] == c]
+                  s = Counter(f['severity'] for f in sub)
+                  L.append(f"| {c} | {len(sub)} | {s['critical']} | {s['high']} | {s['medium']} | {s['low']} |")
+              L.append(f"| **Итого** | **{len(findings)}** | **{sev['critical']}** | **{sev['high']}** | "
+                       f"**{sev['medium']}** | **{sev['low']}** |")
+              L += ['', '## План проверки (выбранные инструменты)', '',
+                    '| Инструмент | Категория | Решение | Обоснование |', '|---|---|---|---|']
+              for name, c, decision, reason in plan_rows(plan):
+                  L.append(f"| {name} | {c} | {decision} | {reason} |")
+              L += ['', '## Выполнение', '', '| Инструмент | Категория | Статус | Находок (сырьё) |',
+                    '|---|---|---|---:|']
+              for tr in tool_runs:
+                  L.append(f"| {tr['tool']} | {tr['category']} | {tr['status']} | {tr['raw_findings']} |")
+              for sb in sbom_info:
+                  st = sb['sbom']['stats']
+                  L.append(f"| SBOM ({sb['tool']}) | SBOM | Готов | компонентов: {st['components']} "
+                           f"({', '.join(f'{k}: {v}' for k, v in st['ecosystems'].items())}) |")
+              L += ['', '## Находки', '']
+              for c in ('Secrets', 'SAST', 'SCA'):
+                  sub = [f for f in findings if f['category'] == c]
+                  if not sub:
+                      continue
+                  L += [f'### {c} ({len(sub)})', '',
+                        '| ID | Уровень | Что найдено | Где | Источники | Исправление |',
+                        '|---|---|---|---|---|---|']
+                  for f in sub:
+                      where = f.get('file', '')
+                      if f.get('line'):
+                          where += f":{f['line']}"
+                      if f['category'] == 'SCA':
+                          where = f"{f.get('package', '')}@{f.get('version', '')}"
+                      L.append(f"| {f['id']} | {SEV_RU[f['severity']]} | {f['title'][:90]} | `{where}` | "
+                               f"{', '.join(f['sources'])} | {f.get('fixed') or '—'} |")
+                  L.append('')
+              L += ['## Что делать дальше', '',
+                    '1. **Secrets** — отозвать и перевыпустить значения, удалить из истории git.',
+                    '2. **SAST критического и высокого уровня** — исправить до слияния в основную ветку.',
+                    '3. **SCA** — обновить пакеты до версий из колонки «Исправление»; для недоступных '
+                    'обновлений зафиксировать оценку риска.',
+                    '4. Повторить проверку: пайплайн запускается на каждый pull request.']
+              return '\n'.join(L) + '\n'
+
+
+          def build_html(meta, plan, tool_runs, findings, sbom_info):
+              sev = Counter(f['severity'] for f in findings)
+              cat = Counter(f['category'] for f in findings)
+              esc = html.escape
+
+              def badge(s):
+                  return f'<span class="sev {s}">{SEV_RU[s]}</span>'
+
+              cards = ''.join(
+                  f'<div class="card"><div class="num">{sev[s]}</div><div class="lbl">{SEV_RU[s]}</div></div>'
+                  for s in ('critical', 'high', 'medium', 'low'))
+              plan_tr = ''.join(
+                  f"<tr><td><b>{esc(n)}</b></td><td>{esc(c)}</td>"
+                  f"<td>{'<span class=ok>Запущен</span>' if d == 'Запущен' else '<span class=skip>Не выбран</span>'}</td>"
+                  f"<td>{esc(r)}</td></tr>" for n, c, d, r in plan_rows(plan))
+              run_tr = ''.join(
+                  f"<tr><td>{esc(t['tool'])}</td><td>{esc(t['category'])}</td><td>{esc(t['status'])}</td>"
+                  f"<td class=r>{t['raw_findings']}</td></tr>" for t in tool_runs)
+              for sb in sbom_info:
+                  st = sb['sbom']['stats']
+                  eco = ', '.join(f'{k}: {v}' for k, v in st['ecosystems'].items())
+                  run_tr += (f"<tr><td>SBOM ({esc(sb['tool'])})</td><td>SBOM</td><td>Готов</td>"
+                             f"<td class=r>{st['components']} компонентов ({esc(eco)})</td></tr>")
+              sections = ''
+              for c, title in (('Secrets', 'Секреты в коде и истории'), ('SAST', 'Недостатки кода (SAST)'),
+                               ('SCA', 'Уязвимые зависимости (SCA)')):
+                  sub = [f for f in findings if f['category'] == c]
+                  if not sub:
+                      sections += f'<h2>{title}</h2><p class="muted">Находок нет.</p>'
+                      continue
+                  rows_html = ''
+                  for f in sub:
+                      where = f.get('file', '')
+                      if f.get('line'):
+                          where += f":{f['line']}"
+                      if c == 'SCA':
+                          where = f"{f.get('package', '')}@{f.get('version', '')}"
+                      rows_html += (
+                          f"<tr data-sev='{f['severity']}' data-cat='{c}'><td>{f['id']}</td>"
+                          f"<td>{badge(f['severity'])}</td><td>{esc(f['title'][:140])}"
+                          f"<div class='muted'>{esc(f.get('cwe') or f['rule'])}</div></td>"
+                          f"<td><code>{esc(where)}</code></td><td>{esc(', '.join(f['sources']))}</td>"
+                          f"<td>{esc(f.get('fixed') or '—')}</td></tr>")
+                  sections += (f'<h2>{title} <span class="muted">({len(sub)})</span></h2>'
+                               f'<table class="findings"><thead><tr><th>ID</th><th>Уровень</th><th>Что найдено</th>'
+                               f'<th>Где</th><th>Источники</th><th>Исправлено в</th></tr></thead>'
+                               f'<tbody>{rows_html}</tbody></table>'
+                               f'<p class="muted">{esc(REMEDIATION[c])}</p>')
+              langs = ', '.join(meta.get('languages', []))
+              return f"""<!DOCTYPE html>
+          <html lang="ru"><head><meta charset="utf-8">
+          <title>Отчёт проверки безопасности — {esc(meta['project'])}</title>
+          <style>
+          body{{font-family:'Segoe UI',Arial,sans-serif;margin:0;background:#f4f6fa;color:#1c2733}}
+          header{{background:linear-gradient(120deg,#0d2b52,#14509e);color:#fff;padding:28px 40px}}
+          header h1{{margin:0 0 6px;font-size:24px}} header p{{margin:2px 0;opacity:.85}}
+          main{{max-width:1180px;margin:0 auto;padding:24px 20px 60px}}
+          .cards{{display:flex;gap:14px;flex-wrap:wrap;margin:18px 0}}
+          .card{{background:#fff;border-radius:10px;padding:16px 22px;box-shadow:0 1px 4px rgba(13,43,82,.12);min-width:120px}}
+          .card .num{{font-size:30px;font-weight:700}} .card .lbl{{color:#5a6b7d}}
+          h2{{margin-top:34px;font-size:18px}}
+          table{{border-collapse:collapse;width:100%;background:#fff;box-shadow:0 1px 4px rgba(13,43,82,.08)}}
+          th,td{{border:1px solid #dfe6ee;padding:7px 9px;font-size:13px;text-align:left;vertical-align:top}}
+          th{{background:#e8eef7}}
+          td.r{{text-align:right}}
+          .sev{{padding:2px 8px;border-radius:10px;color:#fff;font-size:11px;white-space:nowrap}}
+          .critical{{background:#b00020}} .high{{background:#e65100}} .medium{{background:#c49000}}
+          .low{{background:#4e6e8e}} .info{{background:#78909c}}
+          .ok{{color:#1b7a43;font-weight:600}} .skip{{color:#8a97a5}}
+          .muted{{color:#5a6b7d;font-size:12px}}
+          code{{font-family:Consolas,monospace;font-size:12px}}
+          .controls{{margin:14px 0}} select{{padding:6px 10px;border-radius:6px;border:1px solid #b9c6d4}}
+          </style></head><body>
+          <header><h1>Отчёт проверки безопасности: {esc(meta['project'])}</h1>
+          <p>{esc(meta['generated_at'])} · {esc(meta.get('ref',''))} · Языки: {esc(langs)}</p>
+          <p>Всего находок после объединения источников: <b>{len(findings)}</b> ·
+          SAST: {cat['SAST']} · Secrets: {cat['Secrets']} · SCA: {cat['SCA']}</p></header>
+          <main>
+          <div class="cards">{cards}</div>
+          <h2>План проверки</h2>
+          <table><thead><tr><th>Инструмент</th><th>Категория</th><th>Решение</th><th>Обоснование</th></tr></thead>
+          <tbody>{plan_tr}</tbody></table>
+          <h2>Выполнение</h2>
+          <table><thead><tr><th>Инструмент</th><th>Категория</th><th>Статус</th><th>Находок</th></tr></thead>
+          <tbody>{run_tr}</tbody></table>
+          <div class="controls">Показывать уровень:
+          <select id="f"><option value="">все</option><option>critical</option><option>high</option>
+          <option>medium</option><option>low</option></select></div>
+          {sections}
+          <h2>Что делать дальше</h2>
+          <ol><li><b>Secrets</b> — отозвать и перевыпустить значения, удалить из истории git.</li>
+          <li><b>SAST критического и высокого уровня</b> — исправить до слияния в основную ветку.</li>
+          <li><b>SCA</b> — обновить пакеты до исправленных версий; для недоступных обновлений зафиксировать риск.</li></ol>
+          <p class="muted">Отчёт сформирован единым пайплайном: SAST (Semgrep, CodeQL), secret scanning
+          (Gitleaks, TruffleHog), SBOM (cdxgen, Syft), SCA (OSV-Scanner, Grype). Значения секретов в отчёт не включаются.</p>
+          </main>
+          <script>
+          document.getElementById('f').addEventListener('change', e => {{
+            document.querySelectorAll('.findings tbody tr').forEach(tr =>
+              tr.style.display = (!e.target.value || tr.dataset.sev === e.target.value) ? '' : 'none');
+          }});
+          </script></body></html>"""
+
+
+          # ---------------------------------------------------------------- main
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument('--raw', required=True)
+              ap.add_argument('--plan', required=True)
+              ap.add_argument('--out', required=True)
+              ap.add_argument('--project', default='target')
+              ap.add_argument('--ref', default='')
+              ap.add_argument('--fail-on', default='none', choices=['none', 'critical', 'high', 'medium'])
+              ap.add_argument('--target', default='')
+              args = ap.parse_args()
+
+              raw, out = Path(args.raw), Path(args.out)
+              out.mkdir(parents=True, exist_ok=True)
+              plan = load_json(args.plan) or {}
+              from datetime import datetime, timezone
+              meta = {'project': args.project, 'ref': args.ref,
+                      'generated_at': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
+                      'languages': [l['name'] for l in plan.get('facts', {}).get('languages', [])]}
+
+              findings, tool_runs = [], []
+              selected = {k: v.get('run') for k, v in plan.get('tools', {}).items()}
+              key_of = {'Semgrep': 'semgrep', 'CodeQL': 'codeql', 'Gitleaks': 'gitleaks',
+                        'TruffleHog': 'trufflehog', 'OSV-Scanner': 'osv-scanner', 'Grype': 'grype'}
+              for tool, cat, patterns in PARSERS:
+                  planned = selected.get(key_of[tool], True)
+                  path = first_existing(raw, patterns) if raw.exists() else None
+                  if not planned:
+                      tool_runs.append({'tool': tool, 'category': cat, 'status': 'Не выбран по плану',
+                                        'raw_findings': 0})
+                      continue
+                  if tool == 'CodeQL' and raw.exists():
+                      parsed = []
+                      for sarif in sorted(set(raw.glob('codeql/**/*.sarif')) | set(raw.glob('codeql/*.sarif'))):
+                          parsed += parse_codeql(sarif)
+                      status = 'Выполнен' if parsed or list(raw.glob('codeql/**/*.sarif')) else 'Нет отчёта'
+                  elif path is not None:
+                      parsed = PARSE_FN[tool](path)
+                      status = 'Выполнен'
+                  else:
+                      parsed, status = [], 'Нет отчёта'
+                  findings += parsed
+                  tool_runs.append({'tool': tool, 'category': cat, 'status': status,
+                                    'raw_findings': len(parsed)})
+
+              sbom_info = []
+              for tool, patterns in (('cdxgen', ['sbom/cdxgen/*.cdx.json', 'sbom/cdxgen/*.json']),
+                                     ('syft', ['sbom/syft/*.cdx.json', 'sbom/syft/*.json'])):
+                  path = first_existing(raw, patterns) if raw.exists() else None
+                  if path is not None:
+                      sbom_info.append({'tool': tool, 'sbom': parse_sbom(path)})
+
+              if args.target:
+                  pref = str(Path(args.target).resolve())
+                  for f in findings:
+                      if f.get('file', '').startswith(pref):
+                          f['file'] = f['file'][len(pref):].lstrip('/')
+              uniq = dedup(findings)
+              registry = {'meta': meta, 'plan': plan, 'tool_runs': tool_runs,
+                          'sbom': sbom_info, 'findings': uniq}
+              (out / 'findings.json').write_text(json.dumps(registry, ensure_ascii=False, indent=2),
+                                                 encoding='utf-8')
+              (out / 'report.md').write_text(build_md(meta, plan, tool_runs, uniq, sbom_info),
+                                             encoding='utf-8')
+              (out / 'report.html').write_text(build_html(meta, plan, tool_runs, uniq, sbom_info),
+                                               encoding='utf-8')
+              sev = Counter(f['severity'] for f in uniq)
+              print(f"Итого находок: {len(uniq)} (critical {sev['critical']}, high {sev['high']}, "
+                    f"medium {sev['medium']}, low {sev['low']})")
+              if args.fail_on != 'none':
+                  threshold = SEV_ORDER[args.fail_on]
+                  if any(SEV_ORDER[f['severity']] <= threshold for f in uniq):
+                      print(f'GATE: есть находки уровня {args.fail_on} и выше', file=sys.stderr)
+                      return 1
+              return 0
+
+
+          if __name__ == '__main__':
+              sys.exit(main())
+          EOF_NORMALIZE_PY
+          cat > scripts/run_local.sh <<'EOF_RUN_LOCAL'
+          #!/usr/bin/env bash
+          # Локальный запуск единого security-пайплайна (зеркало GitHub Actions workflow).
+          #
+          #   scripts/run_local.sh <путь-или-git-url> [каталог-результатов]
+          #
+          # Инструменты ищутся в PATH; каталог с бинарными файлами можно подсказать:
+          #   TOOLS_BIN=/path/to/bin scripts/run_local.sh ./my-project
+          # Порог quality gate: GATE=high|critical|medium|none (по умолчанию none).
+          set -uo pipefail
+
+          TARGET_IN="${1:?Укажите путь к проекту или git URL}"
+          OUT="${2:-security-results}"
+          GATE="${GATE:-none}"
+          ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+          [ -n "${TOOLS_BIN:-}" ] && export PATH="$TOOLS_BIN:$PATH"
+
+          # --- цель: локальный путь или клон ---------------------------------------
+          if [[ "$TARGET_IN" =~ ^https?:// || "$TARGET_IN" =~ ^git@ ]]; then
+            TARGET="$OUT/target-src"
+            mkdir -p "$OUT"
+            [ -d "$TARGET/.git" ] || git clone --quiet "$TARGET_IN" "$TARGET"
+          else
+            TARGET="$(cd "$TARGET_IN" && pwd)"
+          fi
+          PROJECT="$(basename "$TARGET")"
+          REF="$(git -C "$TARGET" rev-parse --short HEAD 2>/dev/null || echo 'working tree')"
+
+          OUT="$(mkdir -p "$OUT" && cd "$OUT" && pwd)"
+          RAW="$OUT/raw"
+          mkdir -p "$RAW"/{semgrep,codeql,gitleaks,trufflehog,osv,grype,sbom/cdxgen,sbom/syft}
+          echo "== Проект: $PROJECT ($REF) =="
+
+          # --- 1. Детектор: языки, структура, выбор инструментов --------------------
+          python3 "$ROOT/scripts/detect.py" --target "$TARGET" --out "$OUT/plan.json" > /dev/null
+          plan() { python3 -c "import json,sys; d=json.load(open('$OUT/plan.json')); print(eval(sys.argv[1]))" "$1"; }
+          RUN_SEMGREP=$(plan "d['tools']['semgrep']['run']")
+          RUN_CODEQL=$(plan "d['tools']['codeql']['run']")
+          RUN_CDXGEN=$(plan "d['tools']['cdxgen']['run']")
+          RUN_OSV=$(plan "d['tools']['osv-scanner']['run']")
+          GIT_COMMITS=$(plan "d['facts']['git']['commits']")
+          jq -r '.tools | to_entries[] | "  \(.key): \(if .value.run then "запуск" else "пропуск" end) — \(.value.reason)"' "$OUT/plan.json" 2>/dev/null || true
+
+          # --- 2. Secret scanning -----------------------------------------------------
+          if command -v gitleaks >/dev/null; then
+            if [ "$GIT_COMMITS" -gt 0 ] 2>/dev/null; then
+              gitleaks git --redact --no-banner --report-format json \
+                --report-path "$RAW/gitleaks/results.json" "$TARGET" >/dev/null 2>&1 || true
+            else
+              gitleaks dir --redact --no-banner --report-format json \
+                --report-path "$RAW/gitleaks/results.json" "$TARGET" >/dev/null 2>&1 || true
+            fi
+            [ -s "$RAW/gitleaks/results.json" ] || echo '[]' > "$RAW/gitleaks/results.json"
+          fi
+          if command -v trufflehog >/dev/null; then
+            if [ "$GIT_COMMITS" -gt 0 ] 2>/dev/null; then
+              trufflehog git "file://$TARGET" --json --no-update --no-verification \
+                > "$RAW/trufflehog/raw.jsonl" 2>/dev/null || true
+            else
+              trufflehog filesystem "$TARGET" --json --no-update --no-verification \
+                > "$RAW/trufflehog/raw.jsonl" 2>/dev/null || true
+            fi
+          fi
+
+            if [ -s "$RAW/trufflehog/raw.jsonl" ]; then
+              jq -R -c 'fromjson? | {DetectorName, SourceMetadata, Verified}' \
+                "$RAW/trufflehog/raw.jsonl" > "$RAW/trufflehog/results.json" || true
+              rm -f "$RAW/trufflehog/raw.jsonl"
+            fi
+            [ -f "$RAW/trufflehog/results.json" ] || : > "$RAW/trufflehog/results.json"
+
+          # --- 3. SAST ----------------------------------------------------------------
+          if [ "$RUN_SEMGREP" = "True" ] && command -v semgrep >/dev/null; then
+            CONFIGS=()
+            while IFS= read -r c; do CONFIGS+=(--config "$c"); done \
+              < <(python3 -c "import json; [print(c) for c in json.load(open('$OUT/plan.json'))['tools']['semgrep']['configs']]")
+            semgrep scan "${CONFIGS[@]}" --json --output "$RAW/semgrep/semgrep.json" \
+              --exclude node_modules --exclude .git --exclude dist --exclude build \
+              "$TARGET" >/dev/null 2>&1 || true
+          fi
+          if [ "$RUN_CODEQL" = "True" ] && command -v codeql >/dev/null; then
+            while IFS= read -r lang; do
+              pack="${lang%%-*}"
+              db="$OUT/codeql-db-$lang"
+              codeql database create "$db" --language="$lang" --source-root="$TARGET" \
+                --build-mode=none --overwrite >/dev/null 2>&1 \
+                || codeql database create "$db" --language="$lang" --source-root="$TARGET" \
+                     --overwrite >/dev/null 2>&1 || continue
+              codeql database analyze "$db" --format=sarif-latest --threads="${CODEQL_THREADS:-2}" \
+                --output="$RAW/codeql/$lang.sarif" --download \
+                "codeql/$pack-queries:codeql-suites/$pack-security-and-quality.qls" \
+                >/dev/null 2>&1 || true
+              rm -rf "$db"
+            done < <(python3 -c "import json; [print(l) for l in json.load(open('$OUT/plan.json'))['tools']['codeql']['languages']]")
+          fi
+
+          # --- 4. SBOM ------------------------------------------------------------------
+          if [ "$RUN_CDXGEN" = "True" ] && command -v cdxgen >/dev/null; then
+            cdxgen --recurse --output "$RAW/sbom/cdxgen/sbom.cdx.json" "$TARGET" >/dev/null 2>&1 || true
+          fi
+          if command -v syft >/dev/null; then
+            syft packages "dir:$TARGET" -o "cyclonedx-json=$RAW/sbom/syft/sbom.cdx.json" >/dev/null 2>&1 || true
+          fi
+
+          # --- 5. SCA -------------------------------------------------------------------
+          if [ "$RUN_OSV" = "True" ] && command -v osv-scanner >/dev/null; then
+            (cd "$TARGET" && osv-scanner scan source -r . --no-ignore --format json \
+               --output-file "$RAW/osv/osv.json" >/dev/null 2>&1) || true
+          fi
+          if command -v grype >/dev/null; then
+            if [ -s "$RAW/sbom/syft/sbom.cdx.json" ]; then
+              grype "sbom:$RAW/sbom/syft/sbom.cdx.json" -o json --file "$RAW/grype/grype.json" >/dev/null 2>&1 || true
+            else
+              grype "dir:$TARGET" -o json --file "$RAW/grype/grype.json" >/dev/null 2>&1 || true
+            fi
+          fi
+
+          # --- 6. Единый отчёт ------------------------------------------------------------
+          python3 "$ROOT/scripts/normalize_report.py" --raw "$RAW" --plan "$OUT/plan.json" \
+            --out "$OUT" --project "$PROJECT" --ref "$REF" --fail-on "$GATE" --target "$TARGET"
+          STATUS=$?
+          echo
+          echo "Отчёт:  $OUT/report.html"
+          echo "        $OUT/report.md"
+          echo "Реестр: $OUT/findings.json"
+          exit $STATUS
+          EOF_RUN_LOCAL
+          cat > config/gitleaks.toml <<'EOF_GITLEAKS'
+          # Конфигурация Gitleaks пайплайна: правила по умолчанию + allowlist служебных путей.
+          title = "security-pipeline"
+
+          [extend]
+          useDefault = true
+
+          [allowlist]
+          description = "Служебные каталоги и отчёты самого пайплайна"
+          paths = [
+            '''security-results/''',
+            '''examples/''',
+            '''node_modules/''',
+            '''.*\.sarif''',
+            '''findings\.json''',
+          ]
+          EOF_GITLEAKS
+          [ -f README.md ] || cat > README.md <<'EOF_README'
+          # Security Pipeline
+
+          Единый конвейер проверки безопасности: SAST (Semgrep, CodeQL),
+          secret scanning (Gitleaks, TruffleHog), SBOM (cdxgen, Syft), SCA (OSV-Scanner, Grype).
+
+          Структура создана автоматически workflow `security-pipeline.yml`:
+          папки `scripts/`, `config/`, `examples/` и скрипты в них. Повторный запуск
+          workflow обновляет скрипты до актуальной версии.
+
+          Запуск: Actions -> Security Pipeline -> Run workflow.
+          Локально: `scripts/run_local.sh <проект | git-url>`.
+          Отчёт запуска: артефакт **security-report** (`report.html`, `report.md`, `findings.json`).
+          EOF_README
+          touch examples/dvna/.gitkeep examples/vampi/.gitkeep
+          chmod +x scripts/detect.py scripts/normalize_report.py scripts/run_local.sh
+          echo "Структура создана:"
+          find scripts config examples -type f | sort
+
+      - name: Commit structure to repository
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scripts config examples README.md
+          if git diff --cached --quiet; then
+            echo "Структура уже актуальна, коммит не нужен."
+            exit 0
+          fi
+          git commit -m "Bootstrap security pipeline structure"
+          git push origin "HEAD:${{ github.ref_name }}"
+
+  # ------------------------------------------------------------------ detect
+  detect:
+    name: 'Этап 1 · Анализ проекта и выбор инструментов'
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      semgrep: ${{ steps.plan.outputs.semgrep }}
+      codeql: ${{ steps.plan.outputs.codeql }}
+      codeql_matrix: ${{ steps.plan.outputs.codeql_matrix }}
+      cdxgen: ${{ steps.plan.outputs.cdxgen }}
+      osv_scanner: ${{ steps.plan.outputs.osv_scanner }}
+    steps:
+      - name: Checkout pipeline (актуальная структура после setup)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Checkout target project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repository || github.repository }}
+          ref: ${{ inputs.target_ref || '' }}
+          path: target
+          fetch-depth: 0
+
+      - name: Detect languages, ecosystems and select tools
+        id: plan
+        run: |
+          mkdir -p "$RESULTS_DIR"
+          python3 scripts/detect.py --target target --out "$RESULTS_DIR/plan.json"
+
+      - name: Upload scan plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-plan
+          path: ${{ env.RESULTS_DIR }}/plan.json
+          retention-days: 14
+
+  # ----------------------------------------------------------------- secrets
+  secrets:
+    name: 'Этап 2 · Secret scanning (Gitleaks, TruffleHog)'
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout target project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repository || github.repository }}
+          ref: ${{ inputs.target_ref || '' }}
+          path: target
+          fetch-depth: 0
+
+      - name: Install Gitleaks
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          url=$(curl -sSf -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/gitleaks/gitleaks/releases/latest | jq -r '.assets[] | select(.name | test("linux_x64\\.tar\\.gz$")) | .browser_download_url')
+          curl -sSfL "$url" | sudo tar -xz -C /usr/local/bin gitleaks
+
+      - name: Install TruffleHog
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sudo sh -s -- -b /usr/local/bin
+
+      - name: Run secret scanners
+        run: |
+          mkdir -p "$RESULTS_DIR/raw/gitleaks" "$RESULTS_DIR/raw/trufflehog"
+          gitleaks git --redact --no-banner --report-format json --report-path "$RESULTS_DIR/raw/gitleaks/results.json" target || true
+          [ -s "$RESULTS_DIR/raw/gitleaks/results.json" ] || echo '[]' > "$RESULTS_DIR/raw/gitleaks/results.json"
+          trufflehog git "file://$GITHUB_WORKSPACE/target" --json --no-update --no-verification > "$RESULTS_DIR/raw/trufflehog/raw.jsonl" || true
+          jq -R -c 'fromjson? | {DetectorName, SourceMetadata, Verified}' "$RESULTS_DIR/raw/trufflehog/raw.jsonl" > "$RESULTS_DIR/raw/trufflehog/results.json" || true
+          rm -f "$RESULTS_DIR/raw/trufflehog/raw.jsonl"
+
+      - name: Upload raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-secrets
+          path: ${{ env.RESULTS_DIR }}/raw
+          retention-days: 14
+
+  # -------------------------------------------------------------- sast-semgrep
+  sast-semgrep:
+    name: 'Этап 3 · SAST (Semgrep)'
+    needs: detect
+    if: needs.detect.outputs.semgrep == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout pipeline
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Checkout target project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repository || github.repository }}
+          ref: ${{ inputs.target_ref || '' }}
+          path: target
+          fetch-depth: 1
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Download scan plan
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-plan
+          path: ${{ env.RESULTS_DIR }}
+
+      - name: Run Semgrep (rule packs from scan plan)
+        run: |
+          mkdir -p "$RESULTS_DIR/raw/semgrep"
+          CONFIGS=()
+          while IFS= read -r cfg; do CONFIGS+=(--config "$cfg"); done < <(jq -r '.tools.semgrep.configs[]' "$RESULTS_DIR/plan.json")
+          semgrep scan "${CONFIGS[@]}" --json --output "$RESULTS_DIR/raw/semgrep/semgrep.json" --exclude node_modules --exclude .git --exclude dist --exclude build target || true
+
+      - name: Upload raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-semgrep
+          path: ${{ env.RESULTS_DIR }}/raw
+          retention-days: 14
+
+  # --------------------------------------------------------------- sast-codeql
+  sast-codeql:
+    name: 'Этап 3 · SAST CodeQL (${{ matrix.language }})'
+    needs: detect
+    if: needs.detect.outputs.codeql == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.codeql_matrix) }}
+    steps:
+      - name: Checkout target project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repository || github.repository }}
+          ref: ${{ inputs.target_ref || '' }}
+          path: target
+          fetch-depth: 1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          source-root: target
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          output: ${{ env.RESULTS_DIR }}/raw/codeql
+          upload: never
+          category: codeql-${{ matrix.language }}
+
+      - name: Upload raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-codeql-${{ matrix.language }}
+          path: ${{ env.RESULTS_DIR }}/raw
+          retention-days: 14
+
+  # --------------------------------------------------------------------- sbom
+  sbom:
+    name: 'Этап 4 · SBOM (cdxgen, Syft)'
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout target project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repository || github.repository }}
+          ref: ${{ inputs.target_ref || '' }}
+          path: target
+          fetch-depth: 1
+
+      - name: Install cdxgen and Syft
+        run: |
+          npm install -g @cyclonedx/cdxgen
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+
+      - name: Download scan plan
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-plan
+          path: ${{ env.RESULTS_DIR }}
+
+      - name: Build SBOM from dependency graph (cdxgen)
+        if: needs.detect.outputs.cdxgen == 'true'
+        run: |
+          mkdir -p "$RESULTS_DIR/raw/sbom/cdxgen"
+          cdxgen --recurse --output "$RESULTS_DIR/raw/sbom/cdxgen/sbom.cdx.json" target || true
+
+      - name: Build SBOM from filesystem (Syft)
+        run: |
+          mkdir -p "$RESULTS_DIR/raw/sbom/syft"
+          syft packages dir:target -o "cyclonedx-json=$RESULTS_DIR/raw/sbom/syft/sbom.cdx.json" || true
+
+      - name: Upload SBOM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-sbom
+          path: ${{ env.RESULTS_DIR }}/raw
+          retention-days: 30
+
+  # ---------------------------------------------------------------------- sca
+  sca:
+    name: 'Этап 5 · SCA (OSV-Scanner, Grype)'
+    needs: [detect, sbom]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout target project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repository || github.repository }}
+          ref: ${{ inputs.target_ref || '' }}
+          path: target
+          fetch-depth: 1
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-sbom
+          path: ${{ env.RESULTS_DIR }}/raw
+
+      - name: Install OSV-Scanner and Grype
+        run: |
+          curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o /tmp/osv-scanner
+          sudo install -m 0755 /tmp/osv-scanner /usr/local/bin/osv-scanner
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
+
+      - name: Run OSV-Scanner (lockfiles and manifests)
+        if: needs.detect.outputs.osv_scanner == 'true'
+        run: |
+          mkdir -p "$RESULTS_DIR/raw/osv"
+          (cd target && osv-scanner scan source -r . --no-ignore --format json --output-file "$GITHUB_WORKSPACE/$RESULTS_DIR/raw/osv/osv.json") || true
+
+      - name: Run Grype (by SBOM)
+        run: |
+          mkdir -p "$RESULTS_DIR/raw/grype"
+          if [ -s "$RESULTS_DIR/raw/sbom/syft/sbom.cdx.json" ]; then
+            grype "sbom:$RESULTS_DIR/raw/sbom/syft/sbom.cdx.json" -o json --file "$RESULTS_DIR/raw/grype/grype.json" || true
+          else
+            grype dir:target -o json --file "$RESULTS_DIR/raw/grype/grype.json" || true
+          fi
+
+      - name: Upload raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-sca
+          path: ${{ env.RESULTS_DIR }}/raw
+          retention-days: 14
+
+  # ------------------------------------------------------------------- report
+  report:
+    name: 'Этап 6 · Единый отчёт и quality gate'
+    needs: [detect, secrets, sast-semgrep, sast-codeql, sbom, sca]
+    if: always() && needs.detect.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout pipeline
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Download all raw results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: raw-*
+          path: ${{ env.RESULTS_DIR }}/raw
+          merge-multiple: true
+
+      - name: Download scan plan
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-plan
+          path: ${{ env.RESULTS_DIR }}
+
+      - name: Build unified report
+        run: |
+          PROJECT="${{ inputs.target_repository || github.repository }}"
+          python3 scripts/normalize_report.py --raw "$RESULTS_DIR/raw" --plan "$RESULTS_DIR/plan.json" --out "$RESULTS_DIR" --project "${PROJECT##*/}" --ref "${{ github.sha }}" --target "$GITHUB_WORKSPACE/target"
+          cat "$RESULTS_DIR/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unified report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: |
+            ${{ env.RESULTS_DIR }}/report.html
+            ${{ env.RESULTS_DIR }}/report.md
+            ${{ env.RESULTS_DIR }}/findings.json
+            ${{ env.RESULTS_DIR }}/plan.json
+          retention-days: 30
+
+      - name: Quality gate
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys
+          order = {'info': 0, 'low': 1, 'medium': 2, 'high': 3, 'critical': 4}
+          gate = os.environ['GATE']
+          if gate == 'none':
+              print('Quality gate отключён (fail_on=none)')
+              sys.exit(0)
+          findings = json.load(open(os.path.join(os.environ['RESULTS_DIR'], 'findings.json'), encoding='utf-8'))['findings']
+          bad = [f for f in findings if order[f['severity']] >= order[gate]]
+          print(f'Quality gate {gate}: находок не ниже порога — {len(bad)}')
+          sys.exit(1 if bad else 0)
+          PYEOF
